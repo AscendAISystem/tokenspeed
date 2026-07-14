@@ -16,3 +16,11 @@
 # SOFTWARE.
 
 """Layernorm kernel entry points."""
+
+from __future__ import annotations
+
+# Backend registration (side-effect imports).
+from .ascend import *  # noqa: E402,F401
+import tokenspeed_kernel.ops.layernorm.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.layernorm.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.layernorm.triton  # noqa: E402,F401

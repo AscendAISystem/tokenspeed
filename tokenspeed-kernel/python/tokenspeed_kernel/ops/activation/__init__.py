@@ -16,3 +16,11 @@
 # SOFTWARE.
 
 """Activation kernel entry points."""
+
+from __future__ import annotations
+
+# Backend registration (side-effect imports).
+from .ascend import *  # noqa: E402,F401
+import tokenspeed_kernel.ops.activation.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.activation.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.activation.triton  # noqa: E402,F401
