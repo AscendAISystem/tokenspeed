@@ -1,0 +1,2 @@
+# NPU third-party dependencies (minimal - no CUDA-specific packages)
+torch_npu>=2.9.0

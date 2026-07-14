@@ -48,7 +48,7 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
@@ -177,6 +177,26 @@ def _is_rocm_platform() -> bool:
     return Path("/opt/rocm").exists()
 
 
+def _is_npu_platform() -> bool:
+    """Detect if running on Huawei Ascend NPU (via torch_npu)."""
+    try:
+        import torch
+
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            # Confirm it is Ascend NPU by checking device name
+            try:
+                name = torch.npu.get_device_name(0).lower()
+                if "ascend" in name or "910" in name or "npu" in name:
+                    return True
+            except (RuntimeError, AttributeError):
+                pass
+            # torch.npu is available but not Ascend — could be CUDA with
+            # torch_npu installed; treat as non-NPU for build purposes.
+            return False
+    except (ImportError, AttributeError):
+        pass
+
+
 def _selected_backend() -> str:
     override = os.environ.get(BACKEND_ENV, "").strip().lower()
     if override:
@@ -185,14 +205,16 @@ def _selected_backend() -> str:
             raise RuntimeError(f"{BACKEND_ENV} must be one of: {valid}")
         return override
 
+    if _is_npu_platform():
+        return "npu"
     if _is_cuda_platform():
         return "cuda"
     if _is_rocm_platform():
         return "rocm"
 
     raise RuntimeError(
-        "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "
-        f"Set {BACKEND_ENV}=cuda or {BACKEND_ENV}=rocm."
+        "Unable to detect CUDA, ROCm, or NPU for tokenspeed_kernel dependencies. "
+        f"Set {BACKEND_ENV}=cuda, {BACKEND_ENV}=rocm, or {BACKEND_ENV}=npu."
     )
 
 
@@ -219,9 +241,14 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 def _selected_install_requires() -> list[str]:
     backend = _selected_backend()
     requirements = []
-    requirements.extend(
-        _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
-    )
+    thirdparty_file = REQUIREMENTS_DIR / f"{backend}-thirdparty.txt"
+    if thirdparty_file.exists():
+        requirements.extend(_read_requirements(thirdparty_file))
+    else:
+        # Fall back to common requirements for backends without specific file
+        common_file = REQUIREMENTS_DIR / "common.txt"
+        if common_file.exists():
+            requirements.extend(_read_requirements(common_file))
 
     deduped = []
     seen = set()
@@ -258,6 +285,10 @@ def _refresh_python_install_paths() -> None:
 
 def _install_backend_build_requirements(verbose=False) -> None:
     backend = _selected_backend()
+    req_file = REQUIREMENTS_DIR / f"{backend}.txt"
+    if not req_file.exists():
+        print(f"No build requirements file for {backend} backend; skipping")
+        return
     print(f"Installing {backend} build requirements before native build")
     subprocess.check_call(
         [
@@ -266,7 +297,7 @@ def _install_backend_build_requirements(verbose=False) -> None:
             "pip",
             "install",
             "-r",
-            str(REQUIREMENTS_DIR / f"{backend}.txt"),
+            str(req_file),
             "--no-build-isolation",
         ]
         + _pip_verbose_args(verbose)
@@ -739,7 +770,14 @@ class BuildKernels(build_ext):
     """Compile CUDA kernels into .so files for the CUDA backend."""
 
     def run(self):
-        if _selected_backend() != "cuda":
+        backend = _selected_backend()
+        if backend == "npu":
+            print(
+                f"NPU backend detected; skipping CUDA kernel build. "
+                f"{self.distribution.get_name()}"
+            )
+            return
+        if backend != "cuda":
             print(
                 f"CUDA backend not selected; skipping CUDA kernel build. "
                 f"{self.distribution.get_name()}"
@@ -764,6 +802,9 @@ class BuildNative(Command):
     def run(self):
         backend = _selected_backend()
         _install_backend_build_requirements(getattr(self, "verbose", False))
+        if backend == "npu":
+            print("NPU backend detected; skipping CUDA kernel build")
+            return
         if backend != "cuda":
             print("CUDA backend not selected; skipping CUDA kernel build")
             return

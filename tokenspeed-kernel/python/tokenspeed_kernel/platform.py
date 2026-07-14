@@ -339,18 +339,26 @@ def _detect_platform() -> PlatformInfo:
         import torch
     except ImportError:
         raise RuntimeError(
-            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA or AMD ROCm support."
+            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA, AMD ROCm, "
+            "or Huawei Ascend NPU support."
         ) from None
 
-    if torch.npu.is_available():
+    # Check Huawei Ascend NPU first (hasattr guard for systems without torch_npu)
+    if hasattr(torch, "npu") and torch.npu.is_available():
         if hasattr(torch.version, "hip") and torch.version.hip:
             return _detect_rocm_platform()
-        # Check if this is a Huawei Ascend NPU (not NVIDIA CUDA with torch.npu stub)
-        if hasattr(torch, "npu") and _is_ascend_npu():
+        if _is_ascend_npu():
             return _detect_npu_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    # Fallback: check CUDA (for pure CUDA systems without torch_npu)
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return _detect_cuda_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, "
+        "or Huawei Ascend NPU GPU."
+    )
 
 
 def _is_ascend_npu() -> bool:
@@ -396,7 +404,14 @@ def _detect_cuda_platform() -> PlatformInfo:
     """Detect NVIDIA CUDA platform."""
     import torch
 
-    props = torch.npu.get_device_properties(torch.npu.current_device())
+    # Use torch.cuda when torch.npu is the NPU backend; fallback to torch.cuda
+    # for pure CUDA systems. torch.npu may be unavailable on CUDA-only nodes.
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        dev_mod = torch.npu
+    else:
+        dev_mod = torch.cuda
+
+    props = dev_mod.get_device_properties(dev_mod.current_device())
     arch_version = ArchVersion(props.major, props.minor)
     sm_features = _get_cuda_sm_features(arch_version)
     runtime_features = _get_cuda_runtime_features()
@@ -407,7 +422,7 @@ def _detect_cuda_platform() -> PlatformInfo:
         vendor="nvidia",
         arch_version=arch_version,
         device_name=props.name,
-        device_count=torch.npu.device_count(),
+        device_count=dev_mod.device_count(),
         total_memory=props.total_memory,
         memory_bandwidth=_estimate_bandwidth(props),
         sm_count=props.multi_processor_count,

@@ -38,6 +38,11 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+def is_npu_build() -> bool:
+    """Check if the current environment has Huawei Ascend NPU support."""
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 # List of packages to check versions
 PACKAGE_LIST = [
     "tokenspeed",
@@ -99,6 +104,7 @@ PACKAGE_LIST = [
     "tokenspeed-triton-kernels",
     "tokenspeed-trtllm-kernel",
     "torch",
+    "torch_npu",
     "torch_memory_saver",
     "torchvision",
     "tqdm",
@@ -142,6 +148,94 @@ def get_cuda_info() -> dict[str, object]:
 
         return cuda_info
     return {}
+
+
+def get_npu_info() -> dict[str, object]:
+    """Get Huawei Ascend NPU-related information if available."""
+    if not is_npu_build():
+        return {}
+
+    npu_info: dict[str, object] = {"NPU available": True}
+
+    try:
+        npu_info.update(_get_npu_device_info())
+    except Exception as e:
+        npu_info["NPU device error"] = str(e)
+
+    try:
+        npu_info.update(_get_npu_version_info())
+    except Exception as e:
+        npu_info["NPU version error"] = str(e)
+
+    return npu_info
+
+
+def _get_npu_device_info() -> dict[str, object]:
+    """Get information about available NPU devices."""
+    npu_info: dict[str, object] = {}
+    device_count = torch.npu.device_count()
+    npu_info["NPU device count"] = device_count
+
+    devices: dict[str, list[str]] = {}
+    for device_index in range(device_count):
+        name = torch.npu.get_device_name(device_index)
+        devices.setdefault(name, []).append(str(device_index))
+
+    for name, device_ids in devices.items():
+        npu_info[f"NPU {','.join(device_ids)}"] = name
+
+    # Try to get NPU compute capability / version
+    try:
+        props = torch.npu.get_device_properties(0)
+        total_memory = getattr(props, "total_memory", None)
+        if total_memory:
+            npu_info["NPU total memory (bytes)"] = total_memory
+        multi_processor_count = getattr(props, "multi_processor_count", None)
+        if multi_processor_count:
+            npu_info["NPU AI Core count"] = multi_processor_count
+    except Exception:
+        pass
+
+    return npu_info
+
+
+def _get_npu_version_info() -> dict[str, object]:
+    """Get NPU/CANN version information."""
+    npu_info: dict[str, object] = {}
+
+    # torch_npu version
+    try:
+        import torch_npu
+        npu_info["torch_npu"] = getattr(torch_npu, "__version__", "installed")
+    except ImportError:
+        npu_info["torch_npu"] = "Not Found"
+
+    # CANN version from environment
+    cann_home = os.environ.get("ASCEND_TOOLKIT_HOME", "")
+    if cann_home:
+        npu_info["CANN_HOME"] = cann_home
+
+    ascend_home = os.environ.get("ASCEND_HOME", "")
+    if ascend_home:
+        npu_info["ASCEND_HOME"] = ascend_home
+
+    # Try to read CANN version from version.cfg
+    for version_path in [
+        "/usr/local/Ascend/version.cfg",
+        "/usr/local/Ascend/ascend-toolkit/latest/version.cfg",
+    ]:
+        try:
+            with open(version_path) as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        if k.strip().lower() == "version":
+                            npu_info["CANN version"] = v.strip()
+                            break
+        except (OSError, IOError):
+            continue
+
+    return npu_info
 
 
 def _get_gpu_info() -> dict[str, str]:
@@ -326,6 +420,7 @@ def main() -> None:
     env_info = OrderedDict()
     env_info["Python"] = sys.version.replace("\n", "")
     env_info.update(get_cuda_info())
+    env_info.update(get_npu_info())
     env_info["PyTorch"] = torch.__version__
     env_info.update(get_package_versions(PACKAGE_LIST))
 
