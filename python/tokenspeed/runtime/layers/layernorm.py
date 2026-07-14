@@ -80,7 +80,9 @@ logger = get_colorful_logger(__name__)
 
 
 def _get_process_group(group: tuple[int, ...]):
-    return pg_manager.get_process_group("nccl", group)
+    """Get process group with appropriate backend (nccl for CUDA, hccl for NPU)."""
+    backend = "hccl" if _is_npu else "nccl"
+    return pg_manager.get_process_group(backend, group)
 
 
 class LayerNorm(nn.Module):
@@ -600,6 +602,20 @@ class FusedRMSNorm(nn.Module):
             )
             if fused_result[0] is not None:
                 return fused_result
+
+        # NPU: allgather (via HCCL) + dual RMSNorm decomposition
+        if _is_npu and len(group) > 1:
+            from tokenspeed.runtime.distributed.comm_ops import all_gather as dist_all_gather
+            # Allgather qkv along token dimension (dim=0)
+            gathered_qkv = dist_all_gather(qkv, group, dim=0)
+            q_lora_rank = self.weight_q_a.shape[0]
+            kv_lora_rank = self.weight_kv_a.shape[0]
+            q = gathered_qkv[..., :q_lora_rank]
+            k_nope = gathered_qkv[..., q_lora_rank : q_lora_rank + kv_lora_rank]
+            q_contiguous = torch.empty_like(q)
+            if q.shape[0] > 0:
+                self.forward(input_q_a=q, input_kv_a=k_nope, output_q_a=q_contiguous)
+            return gathered_qkv, q_contiguous, k_nope, None
 
         q_lora_rank = self.weight_q_a.shape[0]
         kv_lora_rank = self.weight_kv_a.shape[0]
