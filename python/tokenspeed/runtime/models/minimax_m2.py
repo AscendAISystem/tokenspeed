@@ -82,9 +82,12 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 logger = logging.getLogger(__name__)
 
 _is_nvidia = current_platform().is_nvidia
+_is_npu = current_platform().is_npu
 
-if _is_nvidia:
+if _is_nvidia and not _is_npu:
     from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm
+else:
+    fp32_router_gemm = None
 
 from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 
@@ -189,7 +192,11 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
 
         # FP32 Router GEMM.
         if self.use_fp32_router_gemm and hidden_states.shape[0] > 0:
-            router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
+            if _is_npu or fp32_router_gemm is None:
+                # NPU: use native matmul
+                router_logits = torch.matmul(hidden_states.float(), self.gate.weight.T.float())
+            else:
+                router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
 

@@ -26,10 +26,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as _F
 from tokenspeed_kernel.platform import current_platform as _current_platform
-from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
-from tokenspeed_kernel.thirdparty.cuda import (
-    moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
-)
+
+_longcat_platform = _current_platform()
+_longcat_is_npu = _longcat_platform.is_npu
+
+if not _longcat_is_npu:
+    from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
+    from tokenspeed_kernel.thirdparty.cuda import (
+        moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
+    )
+else:
+    _dsv3_router_gemm = None
+    _moe_finalize_fuse_shared = None
 from transformers import PretrainedConfig as _PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
@@ -338,7 +346,20 @@ class _RuntimeLongcatMoE(nn.Module):
             )
 
         if deferred_finalize:
-            gemm2_out, expert_weights, expanded_idx = routed_expert_output
+            if _longcat_is_npu or _moe_finalize_fuse_shared is None:
+                # NPU: simple weighted sum fallback
+                gemm2_out, expert_weights, expanded_idx = routed_expert_output
+                output = torch.zeros_like(zero_expert_output) if zero_expert_output is not None else None
+                for i in range(gemm2_out.shape[0]):
+                    idx = expanded_idx[i]
+                    weight = expert_weights[i]
+                    if output is None:
+                        output = gemm2_out[i] * weight
+                    else:
+                        output += gemm2_out[i] * weight
+                if zero_expert_output is not None:
+                    output = output + zero_expert_output
+                return output
             return _moe_finalize_fuse_shared(
                 gemm2_out,
                 expanded_idx,

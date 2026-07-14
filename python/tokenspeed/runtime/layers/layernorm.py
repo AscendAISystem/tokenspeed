@@ -22,19 +22,32 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.communication.triton import (
     allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
 )
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    reducescatter_residual_rmsnorm,
-)
 from tokenspeed_kernel.platform import current_platform
+
+_platform = current_platform()
+_is_npu = _platform.is_npu
+_is_amd = _platform.is_amd
+
+# Communication + normalization fused operations (NVIDIA/AMD-specific)
+if not _is_npu:
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        allgather_dual_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        reducescatter_residual_rmsnorm,
+    )
+else:
+    # NPU: fused ops not available, will use separate comm + norm
+    allgather_dual_rmsnorm = None
+    trtllm_allreduce_residual_rmsnorm = None
+    reducescatter_residual_rmsnorm = None
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -45,9 +58,9 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
-_is_amd = current_platform().is_amd
-
-if _is_amd:
+if _is_npu:
+    from tokenspeed_kernel.ops.layernorm.ascend import rmsnorm as ascend_rmsnorm
+elif _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
@@ -81,6 +94,14 @@ class LayerNorm(nn.Module):
         # There might be no tokens here (e.g. idle/padded graph rows).
         if x.shape[0] == 0:
             return x
+        if current_platform().is_npu:
+            return F.layer_norm(
+                x.float(),
+                (x.shape[-1],),
+                self.weight,
+                self.bias,
+                self.variance_epsilon,
+            ).to(x.dtype)
         if current_platform().is_nvidia:
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         return nn.functional.layer_norm(
@@ -115,7 +136,25 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_npu:
+            if residual is not None:
+                if inplace:
+                    raise ValueError(
+                        "fused add rmsnorm does not support inplace operation"
+                    )
+                return ascend_rmsnorm(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    residual=residual,
+                )
+            return ascend_rmsnorm(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                out=x if inplace else None,
+            )
+        elif _is_amd:
             if residual is not None:
                 if inplace:
                     raise ValueError(
@@ -175,7 +214,15 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
+                if _is_npu:
+                    # NPU: separate allreduce + rmsnorm
+                    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+                    x = all_reduce(x, group)
+                    result = self.forward(x, residual)
+                    if isinstance(result, tuple):
+                        return result[0], result[1], None
+                    return result, None, None
+                elif _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
                     if not current_platform().is_nvidia:
@@ -220,6 +267,14 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
+                if _is_npu:
+                    # NPU: separate reduce_scatter + rmsnorm
+                    from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
+                    x = reduce_scatter(x, group)
+                    result = self.forward(x, residual)
+                    if isinstance(result, tuple):
+                        return result[0], result[1], None
+                    return result, None, None
                 fused_result = reducescatter_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -274,7 +329,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_npu or _is_amd:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
@@ -330,11 +385,19 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
+                if _is_npu:
+                    # NPU: separate allreduce + rmsnorm
+                    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+                    x = all_reduce(x, group)
+                    result = self.forward(x, residual)
+                    if isinstance(result, tuple):
+                        return result[0], result[1], None
+                    return result, None, None
+                elif _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
                     if not current_platform().is_nvidia:
-                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
+                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA, AMD or NPU.")
                     allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
                 fused_result = allreduce_residual_rmsnorm(
                     input_tensor=x,
@@ -377,6 +440,14 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
+                if _is_npu:
+                    # NPU: separate reduce_scatter + rmsnorm
+                    from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
+                    x = reduce_scatter(x, group)
+                    result = self.forward(x, residual)
+                    if isinstance(result, tuple):
+                        return result[0], result[1], None
+                    return result, None, None
                 fused_result = reducescatter_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -443,7 +514,18 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _is_npu:
+            # NPU: use sequential rms_norm via F.rms_norm (ascend backend)
+            for inp, weight, out in [
+                (input_q_a, self.weight_q_a, output_q_a),
+                (input_kv_a, self.weight_kv_a, output_kv_a),
+            ]:
+                normed = F.rms_norm(inp.float(), (inp.shape[-1],), weight=weight.float(), eps=self.q_a_norm.variance_epsilon)
+                if out is not None:
+                    out.copy_(normed.to(inp.dtype))
+                else:
+                    inp.copy_(normed.to(inp.dtype))
+        elif _is_amd:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,
@@ -500,7 +582,7 @@ class FusedRMSNorm(nn.Module):
                 - block_scale: Quantization scales, None if fuse_block_quant_fp8=False
         """
 
-        if len(group) > 1:
+        if len(group) > 1 and allgather_dual_rmsnorm is not None:
             fused_result = allgather_dual_rmsnorm(
                 qkv=qkv,
                 total_num_tokens=total_num_tokens,

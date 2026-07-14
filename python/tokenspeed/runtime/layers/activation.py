@@ -32,11 +32,14 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
-_is_amd = current_platform().is_amd
+_platform = current_platform()
+_is_amd = _platform.is_amd
+_is_npu = _platform.is_npu
 
-if _is_amd:
+if _is_npu:
+    from tokenspeed_kernel.ops.activation.ascend import silu_and_mul
+elif _is_amd:
     from tokenspeed_kernel.ops.activation.triton import silu_and_mul
-
 else:
     from tokenspeed_kernel.ops.activation.flashinfer import (
         silu_and_mul,
