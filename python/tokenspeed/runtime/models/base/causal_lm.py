@@ -247,5 +247,5 @@ class BaseCausalLM(nn.Module):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()

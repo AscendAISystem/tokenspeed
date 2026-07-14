@@ -153,9 +153,9 @@ class CapturableGrammarExecutor:
         self.current_batch: dict | None = None
         self.prev_batch: dict | None = None
 
-        self.stream = torch.cuda.Stream()
-        self.fork_event = torch.cuda.Event()
-        self.bitmask_event = torch.cuda.Event()
+        self.stream = torch.npu.Stream()
+        self.fork_event = torch.npu.Event()
+        self.bitmask_event = torch.npu.Event()
 
     def add_batch(
         self,
@@ -343,9 +343,9 @@ class CapturableGrammarExecutor:
         """
         self.fork_event.record()
 
-        with torch.cuda.stream(self.stream):
+        with torch.npu.stream(self.stream):
 
-            torch.cuda.current_stream().wait_event(self.fork_event)
+            torch.npu.current_stream().wait_event(self.fork_event)
 
             if input_ids_buf_slice is not None:
 
@@ -364,7 +364,7 @@ class CapturableGrammarExecutor:
 
     def wait_bitmask(self) -> None:
         """Join the side stream on the main stream before apply_mask."""
-        torch.cuda.current_stream().wait_event(self.bitmask_event)
+        torch.npu.current_stream().wait_event(self.bitmask_event)
 
     def schedule_post_sampler(
         self,
@@ -489,7 +489,7 @@ def _fill_eager_bitmask(
             input_ids_buf[: bs * spec_num_tokens].view(bs, spec_num_tokens),
             non_blocking=True,
         )
-        sync_ev = torch.cuda.Event()
+        sync_ev = torch.npu.Event()
         sync_ev.record()
         sync_ev.synchronize()
         cand_cpu = eager_buffers.candidates_cpu_buf

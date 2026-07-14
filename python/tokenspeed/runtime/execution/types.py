@@ -47,7 +47,7 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | None = None
+    copy_event: torch.npu.Event | None = None
     output_logits: torch.Tensor | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None

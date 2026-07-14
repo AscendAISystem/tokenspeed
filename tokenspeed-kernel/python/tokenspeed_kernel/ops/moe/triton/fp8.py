@@ -143,7 +143,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
     _release_parameter(w, "w2_weight_scale_inv")
     _release_parameter(w, "w13_weight_scale")
     _release_parameter(w, "w2_weight_scale")
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
 
 
 @register_kernel(

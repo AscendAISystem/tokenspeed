@@ -180,7 +180,7 @@ class DpSamplingComm:
         self._device = (
             torch.device(device)
             if device is not None
-            else torch.device(f"cuda:{torch.cuda.current_device()}")
+            else torch.device(f"cuda:{torch.npu.current_device()}")
         )
 
         self._backend: _ResolvedBackend = _resolve_backend(backend, group)

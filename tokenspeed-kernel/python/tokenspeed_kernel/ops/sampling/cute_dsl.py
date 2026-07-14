@@ -211,7 +211,7 @@ def _invoke_kernel(
     x_tensor = _convert_to_cute(logits)
     max_tensor = _convert_to_cute_1d(out_max)
     idx_tensor = _convert_to_cute_1d(out_idx)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.npu.current_stream().npu_stream)
 
     # Blackwell (sm_100/103) supports redux.sync.max.f32; Hopper falls back to
     # warp shuffles.
@@ -917,7 +917,7 @@ def create_dist_argmax_state(
         "distributed_argmax requires CuTe DSL on NVIDIA Hopper+/Blackwell; "
         "current platform doesn't qualify."
     )
-    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    device = device or torch.device(f"cuda:{torch.npu.current_device()}")
     world_size = group.size()
     assert 1 <= world_size <= 32, (
         f"world_size={world_size} unsupported; must be 1..32 (cross-rank "
@@ -934,7 +934,7 @@ def create_dist_argmax_state(
     slots.zero_()
     round_id_gpu = torch.zeros(1, dtype=torch.int32, device=device)
     warps_done_gpu = torch.zeros(1, dtype=torch.int32, device=device)
-    torch.cuda.current_stream().synchronize()
+    torch.npu.current_stream().synchronize()
     hdl = _symm_mem.rendezvous(slots, group=group)
     assert hdl.rank == rank_in_group and hdl.world_size == world_size, (
         f"symm-mem handle reports rank={hdl.rank}, world_size={hdl.world_size}, "
@@ -1008,7 +1008,7 @@ def _dist_argmax_invoke_kernel(
     x_tensor = _convert_to_cute(logits)
     max_tensor = _convert_to_cute_1d(out_max)
     idx_tensor = _convert_to_cute_1d(out_idx)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.npu.current_stream().npu_stream)
 
     N = logits.shape[1]
     compile_key = (

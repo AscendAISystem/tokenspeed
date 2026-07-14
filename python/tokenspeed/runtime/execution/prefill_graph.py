@@ -301,7 +301,7 @@ class PrefillGraph:
         try:
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
-        except torch.cuda.OutOfMemoryError:
+        except torch.npu.OutOfMemoryError:
             raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(
@@ -342,7 +342,7 @@ class PrefillGraph:
         """Warm up and capture the breakable graph for ``bucket`` from the buffers."""
         for _ in range(self.num_warmup):
             self._run_inner(bucket)
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(pool=self._pool, stream=stream)
         with cap:

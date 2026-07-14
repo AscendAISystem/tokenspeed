@@ -277,7 +277,7 @@ if platform.is_nvidia:
             cute.AddressSpace.gmem,
         )
 
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.npu.current_stream().npu_stream)
         max_active_clusters = get_max_active_clusters(
             cluster_shape_mn[0] * cluster_shape_mn[1]
         )

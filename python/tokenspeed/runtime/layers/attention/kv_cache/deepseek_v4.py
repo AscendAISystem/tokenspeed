@@ -554,7 +554,7 @@ class DeepseekV4CacheMetadata:
         key = (compress_ratio, kv_cache_block_size)
         out = self.decode_compressed_slot_mappings.get(key)
         if out is None or out.shape[0] < num_tokens or out.device != seq_lens.device:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if torch.npu.is_available() and torch.npu.is_current_stream_capturing():
                 raise RuntimeError(
                     "DeepSeek V4 compressed slot metadata must be allocated before "
                     "CUDA graph capture"

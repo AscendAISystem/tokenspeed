@@ -322,8 +322,8 @@ class DFlash(BaseDrafter):
 
         if (
             base_ctx.num_extends == 0
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
+            and torch.npu.is_available()
+            and torch.npu.is_current_stream_capturing()
         ):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
@@ -481,7 +481,7 @@ class DFlash(BaseDrafter):
             page_size=self.page_size,
         )
 
-        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+        if not (torch.npu.is_available() and torch.npu.is_current_stream_capturing()):
             self.attn_backend.init_forward_metadata(
                 bs=bs,
                 num_extends=0,

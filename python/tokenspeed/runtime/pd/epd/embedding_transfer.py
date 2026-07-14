@@ -192,7 +192,7 @@ class MooncakeEmbeddingSender:
         src_deepstack_ptr: int = 0,
         deepstack_width: int = 0,
         deepstack_nbytes: int = 0,
-        copy_event: torch.cuda.Event | None = None,
+        copy_event: torch.npu.Event | None = None,
     ) -> None:
         chunk = EmbeddingChunk(
             room=self.bootstrap_room,

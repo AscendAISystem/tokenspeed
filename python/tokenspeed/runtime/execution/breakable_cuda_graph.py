@@ -151,18 +151,18 @@ class BreakableCapture:
     """
 
     _active: BreakableCapture | None = None
-    _default_capture_stream: torch.cuda.Stream | None = None
+    _default_capture_stream: torch.npu.Stream | None = None
 
     def __init__(
-        self, pool: Any | None = None, stream: torch.cuda.Stream | None = None
+        self, pool: Any | None = None, stream: torch.npu.Stream | None = None
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
-        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph: torch.npu.NPUGraph | None = None
         self._capturing = False
         if stream is None:
             if BreakableCapture._default_capture_stream is None:
-                BreakableCapture._default_capture_stream = torch.cuda.Stream()
+                BreakableCapture._default_capture_stream = torch.npu.Stream()
             stream = BreakableCapture._default_capture_stream
         self._stream = stream
         self._stream_ctx: Any | None = None
@@ -186,8 +186,8 @@ class BreakableCapture:
         self._gc_was_enabled = gc.isenabled()
         gc.disable()
         # The capture stream must observe prior entry-stream work (warmup, buffers).
-        self._stream.wait_stream(torch.cuda.current_stream())
-        self._stream_ctx = torch.cuda.stream(self._stream)
+        self._stream.wait_stream(torch.npu.current_stream())
+        self._stream_ctx = torch.npu.stream(self._stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
         self._begin_segment()
@@ -202,14 +202,14 @@ class BreakableCapture:
                 self._stream_ctx.__exit__(*exc)
                 self._stream_ctx = None
             # Eager breaks ran on the side stream; entry stream must observe them.
-            torch.cuda.current_stream().wait_stream(self._stream)
+            torch.npu.current_stream().wait_stream(self._stream)
             if self._gc_was_enabled:
                 gc.enable()
         return False
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.npu.NPUGraph()
         if self.pool is not None:
             graph.capture_begin(pool=self.pool)
         else:

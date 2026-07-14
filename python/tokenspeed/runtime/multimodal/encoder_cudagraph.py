@@ -47,7 +47,7 @@ class BudgetGraphMetadata:
     ``graph.replay()``, then reads ``output_buffer``.
     """
 
-    graph: torch.cuda.CUDAGraph
+    graph: torch.npu.NPUGraph
     input_buffers: dict[str, torch.Tensor]
     metadata_buffers: dict[str, torch.Tensor]
     output_buffer: torch.Tensor
@@ -421,8 +421,8 @@ class EncoderCudaGraphWrapper:
 
         # No pool= argument: each budget graph gets its own private pool. A
         # shared pool collides custom-AR IPC registrations across budgets.
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
+        graph = torch.npu.NPUGraph()
+        with torch.inference_mode(), ar_ctx, torch.npu.graph(graph):
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer.copy_(output)
 

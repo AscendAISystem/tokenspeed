@@ -513,7 +513,7 @@ class ModelExecutor:
 
             self.encoder_graph_wrappers = active_encoder_graph_wrappers
 
-        self.execution_stream = torch.cuda.Stream()
+        self.execution_stream = torch.npu.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
@@ -1065,7 +1065,7 @@ class ModelExecutor:
 
         sentinel = self._sentinel_neg1
 
-        with torch.cuda.stream(self.execution_stream):
+        with torch.npu.stream(self.execution_stream):
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
             working = self.input_buffers.mamba_pool_indices_buf[:bs]
 
@@ -1411,9 +1411,9 @@ class ModelExecutor:
             hist_token_lens_tensor = None
             decode_pool_indices = None
 
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        self.execution_stream.wait_stream(torch.npu.current_stream())
 
-        with torch.cuda.stream(self.execution_stream):
+        with torch.npu.stream(self.execution_stream):
             if is_prefill:
                 extend_request_pool_indices = torch.tensor(
                     forward_op.request_pool_indices[:num_extends],
@@ -1584,9 +1584,9 @@ class ModelExecutor:
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+            torch.npu.current_stream().wait_stream(self.execution_stream)
+            self.execution_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
@@ -1883,7 +1883,7 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
-                copy_event = torch.cuda.Event()
+                copy_event = torch.npu.Event()
                 copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
@@ -1940,7 +1940,7 @@ class ModelExecutor:
         # Remote spec candidates are CPU materialized; enqueue the H2D copy and
         # future_input_map update on execution_stream. The next forward's input
         # prep already waits on execution_stream before reading runtime state.
-        with torch.cuda.stream(self.execution_stream):
+        with torch.npu.stream(self.execution_stream):
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )

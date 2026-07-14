@@ -756,7 +756,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             or attention_metadata.decode_swa_indices.device != metadata.seq_lens.device
         )
         if needs_alloc:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if torch.npu.is_available() and torch.npu.is_current_stream_capturing():
                 raise RuntimeError(
                     "DeepSeek V4 decode SWA metadata must be allocated before "
                     "CUDA graph capture"
@@ -823,7 +823,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if metadata.is_valid_token is not None
             else None
         )
-        capturing = positions.is_cuda and torch.cuda.is_current_stream_capturing()
+        capturing = positions.is_cuda and torch.npu.is_current_stream_capturing()
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")
@@ -950,7 +950,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _get_decode_tile_metadata(self, kind: str, bs: int):
         phase = (
             "graph"
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            if torch.npu.is_available() and torch.npu.is_current_stream_capturing()
             else "eager"
         )
         tile_metadata = self._decode_tile_metadata.get((phase, kind, bs))

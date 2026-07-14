@@ -227,8 +227,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
     @torch.no_grad()
     def forward(

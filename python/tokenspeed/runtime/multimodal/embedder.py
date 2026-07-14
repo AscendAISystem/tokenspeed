@@ -183,7 +183,7 @@ class VisionEmbedder:
     """Vision-aware input embedding pipeline for one model executor."""
 
     def __init__(self) -> None:
-        self._h2d_stream: torch.cuda.Stream | None = None
+        self._h2d_stream: torch.npu.Stream | None = None
 
     # --- public entry point ------------------------------------------------
 
@@ -378,7 +378,7 @@ class VisionEmbedder:
             encoder_started = time.perf_counter() if LOG_MM_TIMING else None
             output = spec.fn(items)
             if LOG_MM_TIMING and device.type == "cuda":
-                torch.cuda.synchronize(device)
+                torch.npu.synchronize(device)
             encoder_elapsed_ms = (
                 (time.perf_counter() - encoder_started) * 1000
                 if encoder_started is not None
@@ -473,9 +473,9 @@ class VisionEmbedder:
 
     # --- device helpers ----------------------------------------------------
 
-    def _h2d_stream_on(self, device: torch.device) -> torch.cuda.Stream:
+    def _h2d_stream_on(self, device: torch.device) -> torch.npu.Stream:
         if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(device=device)
+            self._h2d_stream = torch.npu.Stream(device=device)
         return self._h2d_stream
 
     def _move_pixel_features_to_device(
@@ -509,8 +509,8 @@ class VisionEmbedder:
             return
 
         h2d = self._h2d_stream_on(device)
-        current = torch.cuda.current_stream(device)
-        with torch.cuda.stream(h2d):
+        current = torch.npu.current_stream(device)
+        with torch.npu.stream(h2d):
             for it in pending:
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)

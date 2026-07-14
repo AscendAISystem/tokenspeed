@@ -1177,7 +1177,7 @@ def gumbel_sample_top_k_top_p_qrita_from_pools(
     """Sample finite top-k/top-p rows using Qrita-style pivots."""
     rows = logits.shape[0]
     if num_programs is None:
-        num_sms = torch.cuda.get_device_properties(logits.device).multi_processor_count
+        num_sms = torch.npu.get_device_properties(logits.device).multi_processor_count
         num_programs = min(num_sms, max(int(rows), 1))
     rows, vocab_size = _check_top_k_top_p_qrita_inputs(
         logits,

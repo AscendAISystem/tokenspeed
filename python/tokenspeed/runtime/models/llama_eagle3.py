@@ -640,8 +640,8 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
 
 EntryClass = [LlamaForCausalLMEagle3]

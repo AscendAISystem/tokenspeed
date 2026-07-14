@@ -261,8 +261,8 @@ class DisaggEncodeExecutor:
         # _lease_slot keeps the slot until its room is terminal (Success only after
         # the RDMA completes).
         copy_event = None
-        if torch.cuda.is_available():
-            copy_event = torch.cuda.Event()
+        if torch.npu.is_available():
+            copy_event = torch.npu.Event()
             copy_event.record()
         for rid, send_args in staged:
             self.senders[rid].send(copy_event=copy_event, **send_args)

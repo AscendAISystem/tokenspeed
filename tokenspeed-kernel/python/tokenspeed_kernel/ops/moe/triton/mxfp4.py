@@ -351,7 +351,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     if current_platform().is_amd:
         _release_parameter(w, "w13_weight_scale")
         _release_parameter(w, "w2_weight_scale")
-    torch.cuda.empty_cache()
+    torch.npu.empty_cache()
 
 
 @register_kernel(

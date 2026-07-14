@@ -141,7 +141,7 @@ class DeepEPCudaGraphRunnerAdapter:
             return None
 
     def capture(self):
-        """Call before ``torch.cuda.graph()`` capture."""
+        """Call before ``torch.npu.graph()`` capture."""
         cls = self._get_buffer_cls()
         if cls is None or cls._buffer is None:
             return
@@ -281,7 +281,7 @@ class CudaGraphWrapper:
             if sampling_backend is not None
             else (CUDA_GRAPH_VARIANT_DEFAULT,)
         )
-        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[tuple[str, int], torch.npu.NPUGraph] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
@@ -303,7 +303,7 @@ class CudaGraphWrapper:
         """
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
-            self.stream = torch.cuda.Stream()
+            self.stream = torch.npu.Stream()
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)
@@ -377,7 +377,7 @@ class CudaGraphWrapper:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
     def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.npu.NPUGraph()
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -455,7 +455,7 @@ class CudaGraphWrapper:
 
         # Warm up before capture.
         for _ in range(4):
-            torch.cuda.synchronize()
+            torch.npu.synchronize()
             dist.barrier()
             self._prepare_sampling_capture(bs=bs, variant=variant)
             # Keep warmup seq_lens >= q_len_per_req so no query row gets an
@@ -469,7 +469,7 @@ class CudaGraphWrapper:
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
 
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         dist.barrier()
 
         # Warmups can switch a backend back to eager metadata objects. Restore
@@ -488,10 +488,10 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
+        with torch.npu.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
             out = run_once()
 
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         dist.barrier()
         _is_capture_mode = False
 

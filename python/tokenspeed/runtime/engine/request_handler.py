@@ -363,10 +363,10 @@ class RequestHandler:
             self.torch_profiler.start()
 
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            torch.npu.memory._record_memory_history(max_entries=100000)
 
         if "CUDA_PROFILER" in activities:
-            torch.cuda.cudart().cudaProfilerStart()
+            torch.npu.cudart().cudaProfilerStart()
 
         if "VIZTRACER" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
@@ -421,11 +421,11 @@ class RequestHandler:
                 self.profiler_output_dir,
                 f"{self.profile_id}-TP-{self.attn_tp_rank}-memory{stage_suffix}.pickle",
             )
-            torch.cuda.memory._dump_snapshot(memory_profile_path)
-            torch.cuda.memory._record_memory_history(enabled=None)
+            torch.npu.memory._dump_snapshot(memory_profile_path)
+            torch.npu.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            torch.cuda.cudart().cudaProfilerStop()
+            torch.npu.cudart().cudaProfilerStop()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()

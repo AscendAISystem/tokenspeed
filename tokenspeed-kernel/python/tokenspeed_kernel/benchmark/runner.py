@@ -70,7 +70,7 @@ class BenchmarkRunner:
     """Benchmarks kernel implementations."""
 
     def __init__(self, config: BenchmarkConfig | None = None):
-        if not torch.cuda.is_available():
+        if not torch.npu.is_available():
             raise RuntimeError("BenchmarkRunner requires CUDA")
         self.config = config or BenchmarkConfig()
         self.config.validate()
@@ -94,15 +94,15 @@ class BenchmarkRunner:
         with torch.no_grad():
             for _ in range(self.config.warmup_iters):
                 kernel(**inputs)
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
 
         if self.config.use_cuda_events:
             start_events = [
-                torch.cuda.Event(enable_timing=True)
+                torch.npu.Event(enable_timing=True)
                 for _ in range(self.config.bench_iters)
             ]
             end_events = [
-                torch.cuda.Event(enable_timing=True)
+                torch.npu.Event(enable_timing=True)
                 for _ in range(self.config.bench_iters)
             ]
             with torch.no_grad():
@@ -110,7 +110,7 @@ class BenchmarkRunner:
                     start_events[i].record()
                     kernel(**inputs)
                     end_events[i].record()
-            torch.cuda.synchronize()
+            torch.npu.synchronize()
             times = [
                 start.elapsed_time(end) * 1000.0
                 for start, end in zip(start_events, end_events, strict=False)
@@ -119,10 +119,10 @@ class BenchmarkRunner:
             times: list[float] = []
             with torch.no_grad():
                 for _ in range(self.config.bench_iters):
-                    torch.cuda.synchronize()
+                    torch.npu.synchronize()
                     t0 = time.perf_counter()
                     kernel(**inputs)
-                    torch.cuda.synchronize()
+                    torch.npu.synchronize()
                     t1 = time.perf_counter()
                     times.append((t1 - t0) * 1e6)
 

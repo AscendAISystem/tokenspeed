@@ -83,7 +83,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = torch.npu.Stream()
         self.decoder = DeepseekV3DecoderLayer(
             config,
             0,

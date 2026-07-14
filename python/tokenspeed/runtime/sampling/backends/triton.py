@@ -204,7 +204,7 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
         max_verify_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
-        num_sms = torch.cuda.get_device_properties(config.device).multi_processor_count
+        num_sms = torch.npu.get_device_properties(config.device).multi_processor_count
         self._qrita_verify_num_programs = min(num_sms, max_verify_rows)
         self._qrita_verify_buffer = torch.empty(
             (self._qrita_verify_num_programs, vocab_size),

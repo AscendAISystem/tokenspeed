@@ -149,6 +149,14 @@ class PlatformInfo:
         return self.is_nvidia and self.arch_version.major == 8
 
     @property
+    def is_huawei(self) -> bool:
+        return self.vendor == "huawei"
+
+    @property
+    def is_npu(self) -> bool:
+        return self.vendor == "huawei"
+
+    @property
     def is_amd(self) -> bool:
         return self.vendor == "amd"
 
@@ -207,7 +215,7 @@ class PlatformInfo:
         """Register host memory that GPU kernels will directly dereference."""
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return
-        status = torch.cuda.cudart().cudaHostRegister(
+        status = torch.npu.cudart().cudaHostRegister(
             tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
         )
         if int(status) != 0:
@@ -334,19 +342,61 @@ def _detect_platform() -> PlatformInfo:
             "tokenspeed-kernel requires PyTorch with NVIDIA CUDA or AMD ROCm support."
         ) from None
 
-    if torch.cuda.is_available():
+    if torch.npu.is_available():
         if hasattr(torch.version, "hip") and torch.version.hip:
             return _detect_rocm_platform()
+        # Check if this is a Huawei Ascend NPU (not NVIDIA CUDA with torch.npu stub)
+        if hasattr(torch, "npu") and _is_ascend_npu():
+            return _detect_npu_platform()
         return _detect_cuda_platform()
 
     raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+
+
+def _is_ascend_npu() -> bool:
+    """Check if the available NPU is a Huawei Ascend device."""
+    try:
+        import torch_npu  # noqa: F401
+        # Check device name for Ascend indicator
+        if torch.npu.device_count() > 0:
+            name = torch.npu.get_device_name(0).lower()
+            return "ascend" in name or "910" in name or "npu" in name
+    except (ImportError, RuntimeError, AttributeError):
+        pass
+    return False
+
+
+def _detect_npu_platform() -> PlatformInfo:
+    """Detect Huawei Ascend NPU platform."""
+    import torch
+
+    props = torch.npu.get_device_properties(torch.npu.current_device())
+    # NPU uses a different property structure; map to unified fields
+    device_name = getattr(props, "name", "AscendNPU")
+    total_memory = getattr(props, "total_memory", 0)
+    multi_processor_count = getattr(props, "multi_processor_count", 1)
+
+    return PlatformInfo(
+        vendor="huawei",
+        arch_version=ArchVersion(1, 0),
+        device_name=device_name,
+        device_count=torch.npu.device_count(),
+        total_memory=total_memory,
+        memory_bandwidth=0.0,  # not easily available via torch API
+        sm_count=multi_processor_count,
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=frozenset(),
+        runtime_features=frozenset({"runtime:npu_graph"}),
+        interconnect=None,
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:
     """Detect NVIDIA CUDA platform."""
     import torch
 
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    props = torch.npu.get_device_properties(torch.npu.current_device())
     arch_version = ArchVersion(props.major, props.minor)
     sm_features = _get_cuda_sm_features(arch_version)
     runtime_features = _get_cuda_runtime_features()
@@ -357,7 +407,7 @@ def _detect_cuda_platform() -> PlatformInfo:
         vendor="nvidia",
         arch_version=arch_version,
         device_name=props.name,
-        device_count=torch.cuda.device_count(),
+        device_count=torch.npu.device_count(),
         total_memory=props.total_memory,
         memory_bandwidth=_estimate_bandwidth(props),
         sm_count=props.multi_processor_count,
@@ -410,7 +460,7 @@ def _detect_rocm_platform() -> PlatformInfo:
     """Detect AMD ROCm platform."""
     import torch
 
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    props = torch.npu.get_device_properties(torch.npu.current_device())
     arch = _extract_amd_arch(props.gcnArchName)
 
     # Map AMD architectures
@@ -426,7 +476,7 @@ def _detect_rocm_platform() -> PlatformInfo:
         vendor="amd",
         arch_version=arch_version,
         device_name=props.name,
-        device_count=torch.cuda.device_count(),
+        device_count=torch.npu.device_count(),
         total_memory=props.total_memory,
         memory_bandwidth=_estimate_amd_bandwidth(props),
         sm_count=props.multi_processor_count,
@@ -499,7 +549,7 @@ def _detect_cuda_interconnect() -> InterconnectInfo | None:
     try:
         import torch
 
-        device_count = torch.cuda.device_count()
+        device_count = torch.npu.device_count()
         if device_count <= 1:
             return InterconnectInfo(topology="single_gpu")
 
@@ -516,7 +566,7 @@ def _detect_rocm_interconnect() -> InterconnectInfo | None:
     try:
         import torch
 
-        device_count = torch.cuda.device_count()
+        device_count = torch.npu.device_count()
         if device_count <= 1:
             return InterconnectInfo(topology="single_gpu")
         # Probe /sys/class/kfd for xGMI links (HSA_IOLINK_TYPE_XGMI = 11).
@@ -555,7 +605,7 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
     try:
         import pynvml
 
-        device_count = torch.cuda.device_count()
+        device_count = torch.npu.device_count()
         if device_count == 0:
             return ()
 
@@ -569,7 +619,7 @@ def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
 
         affinities: list[tuple[int, ...]] = []
         for device_id in range(device_count):
-            props = torch.cuda.get_device_properties(device_id)
+            props = torch.npu.get_device_properties(device_id)
             pci_bus_id = (
                 f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
                 f"{props.pci_device_id:02X}.0"
@@ -602,7 +652,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
     try:
         import pynvml
 
-        device_count = torch.cuda.device_count()
+        device_count = torch.npu.device_count()
         if device_count <= 1:
             return None
 
@@ -611,7 +661,7 @@ def _detect_cuda_nvlink_topology() -> str | None:
 
         handles = []
         for device_id in range(device_count):
-            props = torch.cuda.get_device_properties(device_id)
+            props = torch.npu.get_device_properties(device_id)
             pci_bus_id = (
                 f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
                 f"{props.pci_device_id:02X}.0"

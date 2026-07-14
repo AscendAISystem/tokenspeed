@@ -20,7 +20,7 @@ except Exception:
 
 @cache
 def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
-    device_props = torch.cuda.get_device_properties(0)
+    device_props = torch.npu.get_device_properties(0)
     split_k = device_props.multi_processor_count // grid_size
     if k is not None:
         num_block_k = ceil_div(k, block_k)

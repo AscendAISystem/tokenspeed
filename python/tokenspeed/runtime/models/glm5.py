@@ -295,7 +295,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         layer_id=None,
         prefix: str = "",
         reduce_attn_results=True,
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
     ) -> None:
@@ -998,7 +998,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         quant_config: QuantizationConfig | None = None,
         is_nextn: bool = False,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ) -> None:
         nn.Module.__init__(self)
         self.mapping = mapping
@@ -1159,7 +1159,7 @@ class GlmMoeDsaModel(DeepseekV3Model):
             config.vocab_size,
             config.hidden_size,
         )
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = torch.npu.Stream()
         self.layers = nn.ModuleList(
             [
                 GlmMoeDsaDecoderLayer(

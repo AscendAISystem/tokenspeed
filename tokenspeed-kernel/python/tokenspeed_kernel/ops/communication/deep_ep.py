@@ -64,15 +64,15 @@ except ImportError:
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
-    if torch.cuda.current_device() != gpu_id:
+    if torch.npu.current_device() != gpu_id:
         logger.warning(
             "current device is not %s, but %s, which may cause useless memory allocation for torch CUDA context.",
             gpu_id,
-            torch.cuda.current_device(),
+            torch.npu.current_device(),
         )
     if empty_cache:
-        torch.cuda.empty_cache()
-    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        torch.npu.empty_cache()
+    free_gpu_memory, _ = torch.npu.mem_get_info(gpu_id)
     return free_gpu_memory / (1 << 30)
 
 
@@ -166,7 +166,7 @@ class DeepEPBuffer:
         else:
             raise NotImplementedError
 
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
@@ -175,7 +175,7 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             allow_mnnvl=True,
         )
-        free_gpu_memory_end = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_end = _get_available_gpu_memory(torch.npu.current_device())
         logger.info(
             "DeepEPBuffer use memory %s GB", free_gpu_memory_begin - free_gpu_memory_end
         )

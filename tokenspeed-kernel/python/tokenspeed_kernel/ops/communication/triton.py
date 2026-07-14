@@ -789,13 +789,13 @@ def dp_sampling_gather(
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
-    if torch.cuda.current_device() != gpu_id:
+    if torch.npu.current_device() != gpu_id:
         logger.warning(
-            f"current device is not {gpu_id}, but {torch.cuda.current_device()}, which may cause useless memory allocation for torch CUDA context."
+            f"current device is not {gpu_id}, but {torch.npu.current_device()}, which may cause useless memory allocation for torch CUDA context."
         )
     if empty_cache:
-        torch.cuda.empty_cache()
-    free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+        torch.npu.empty_cache()
+    free_gpu_memory, _ = torch.npu.mem_get_info(gpu_id)
     return free_gpu_memory / (1 << 30)
 
 
@@ -1003,7 +1003,7 @@ def nvidia_create_rsag_state(
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
-    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    device = device or torch.device(f"cuda:{torch.npu.current_device()}")
     # Reserve the symmetric-memory signal pad for the largest grid the
     # reduce-scatter launcher can pick. blockwise_barrier indexes the pad at
     # block_id * world_size + rank, so an _RSAG_MAX_BLOCKS-CTA grid needs
@@ -1014,7 +1014,7 @@ def nvidia_create_rsag_state(
     # below, which bakes the pad size into the allocation.
     pad_bytes = _RSAG_MAX_BLOCKS * group.size() * 4
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-    free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+    free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
     # Allocate outside inference_mode so the persistent comm buffer is not
     # an inference tensor; this class is often lazily constructed during
     # forward (which runs under @maybe_inference_mode). Pair with no_grad
@@ -1023,7 +1023,7 @@ def nvidia_create_rsag_state(
         comm_buff = symm_mem.empty(
             (max_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
-    free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+    free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
     logger.info(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
@@ -1228,18 +1228,18 @@ def amd_create_rsag_state(
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
-    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    device = device or torch.device(f"cuda:{torch.npu.current_device()}")
     world_size = group.size()
     max_blocks = max(1, triton.cdiv(max_tokens * hidden_size, 1024))
     pad_bytes = max_blocks * world_size * 4
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
 
-    free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+    free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
     comm_buff = symm_mem.empty(
         (max_tokens, hidden_size), dtype=torch.bfloat16, device=device
     )
     symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
-    free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+    free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
     logger.info(
         f"Custom Triton RSAG AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
@@ -1429,7 +1429,7 @@ def create_allreduce_residual_rmsnorm_state(
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
-    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+    device = device or torch.device(f"cuda:{torch.npu.current_device()}")
     world_size = group.size()
     comm_buff = None
     symm_mem_hdl = None
@@ -1438,12 +1438,12 @@ def create_allreduce_residual_rmsnorm_state(
     if platform.is_amd:
         pad_bytes = max_token_num * world_size * 4
         symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
         comm_buff = symm_mem.empty(
             (max_token_num, hidden_dim), dtype=torch.bfloat16, device=device
         )
         symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
-        free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
         logger.info(
             f"Triton AR+RMSNorm AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
         )
@@ -1582,7 +1582,7 @@ def allreduce_residual_rmsnorm(
             rank_in_group=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            device=torch.device(f"cuda:{torch.npu.current_device()}"),
         )
         if not allreduce_residual_rmsnorm_can_run(
             state, input_tensor, residual, weight
@@ -1629,7 +1629,7 @@ def create_state(
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
     if max_numel:
-        device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = device or torch.device(f"cuda:{torch.npu.current_device()}")
         world_size = group.size()
         comm_buff = None
         symm_mem_hdl = None
@@ -1640,14 +1640,14 @@ def create_state(
             pad_bytes = max_blocks * world_size * 4
             symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
             free_gpu_memory_begin = _get_available_gpu_memory(
-                torch.cuda.current_device()
+                torch.npu.current_device()
             )
             comm_buff = symm_mem.empty(
                 (max_numel,), dtype=torch.bfloat16, device=device
             )
             symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
             free_gpu_memory_after = _get_available_gpu_memory(
-                torch.cuda.current_device()
+                torch.npu.current_device()
             )
             logger.info(
                 f"Triton all-reduce AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"

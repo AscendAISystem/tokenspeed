@@ -492,7 +492,7 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu")
         yield from state.items()
         del state
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

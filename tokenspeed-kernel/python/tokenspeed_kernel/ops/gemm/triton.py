@@ -129,8 +129,8 @@ def get_w8a8_block_fp8_configs(
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = (
-        torch.cuda.get_device_name().replace(" ", "_")
-        if torch.cuda.is_available()
+        torch.npu.get_device_name().replace(" ", "_")
+        if torch.npu.is_available()
         else "unknown"
     )
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
@@ -403,8 +403,8 @@ def _w8a8_block_fp8_matmul_unrolledx4(
 
 
 def _get_device_core_count(device_id: int = 0) -> int:
-    if torch.cuda.is_available():
-        return torch.cuda.get_device_properties(device_id).multi_processor_count
+    if torch.npu.is_available():
+        return torch.npu.get_device_properties(device_id).multi_processor_count
     return 0
 
 

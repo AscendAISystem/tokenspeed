@@ -319,8 +319,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         workspace_buffer = None
         if self.mm_attention_backend == "flashinfer_cudnn":
-            if torch.cuda.is_available():
-                ws_device = torch.device("cuda", torch.cuda.current_device())
+            if torch.npu.is_available():
+                ws_device = torch.device("cuda", torch.npu.current_device())
             else:
                 ws_device = self.device
             workspace_buffer = torch.empty(

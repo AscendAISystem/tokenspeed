@@ -451,7 +451,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -575,7 +575,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -858,7 +858,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.mapping = mapping
         self.hidden_size = config.hidden_size
 
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.npu.Stream()
 
         # Embedding layer
         self.embed_tokens = VocabParallelEmbedding(

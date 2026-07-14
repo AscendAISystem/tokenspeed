@@ -63,7 +63,7 @@ class CustomAllReduceBackend(CommBackend):
                 gloo_group = pg_manager.get_process_group("gloo", group)
                 ca_comm = CustomAllreduce(
                     group=gloo_group,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                    device=torch.device(f"cuda:{torch.npu.current_device()}"),
                 )
             except Exception:
                 ca_comm = None

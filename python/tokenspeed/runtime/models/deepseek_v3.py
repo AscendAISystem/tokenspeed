@@ -111,7 +111,7 @@ from tokenspeed.runtime.moe.distribution_recorder import (
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.npu_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -265,7 +265,7 @@ class DeepseekV3MoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ):
         super().__init__()
         self.mapping = mapping
@@ -481,7 +481,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         layer_id=None,
         prefix: str = "",
         reduce_attn_results=True,
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
         skip_rope: bool = False,
     ) -> None:
         super().__init__()
@@ -1144,7 +1144,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         is_nextn: bool = False,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -1328,7 +1328,7 @@ class DeepseekV3Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = torch.npu.Stream()
         # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
@@ -1691,8 +1691,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -2099,8 +2099,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
 
 EntryClass = [

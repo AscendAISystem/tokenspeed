@@ -48,7 +48,7 @@ def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
             continue
-        return torch.cuda.can_device_access_peer(rank, i)
+        return torch.npu.can_device_access_peer(rank, i)
     return True
 
 
@@ -311,7 +311,7 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
+            if torch.npu.is_current_stream_capturing():
                 return self.all_reduce(input, registered=True)
             else:
                 # If warm up, mimic the allocation pattern since custom

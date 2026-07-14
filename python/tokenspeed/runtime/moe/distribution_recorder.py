@@ -189,7 +189,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         )
 
     def _on_hook(self, hook_name: str, **kwargs):
-        if not (self._recording or torch.cuda.is_current_stream_capturing()):
+        if not (self._recording or torch.npu.is_current_stream_capturing()):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -720,7 +720,7 @@ class _StatAccumulator(_UtilizationRateAccumulator):
 
         if self._first_dump:
             self._first_dump = False
-            torch.cuda.empty_cache()
+            torch.npu.empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM

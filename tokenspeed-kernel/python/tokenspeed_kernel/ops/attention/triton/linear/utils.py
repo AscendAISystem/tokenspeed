@@ -188,4 +188,4 @@ else:
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
 
     def custom_device_ctx(index: int):
-        return torch.cuda.device(index)
+        return torch.npu.device(index)

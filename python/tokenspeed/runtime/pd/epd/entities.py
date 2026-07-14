@@ -118,7 +118,7 @@ class EmbeddingChunk:
     # filled this chunk's ring slot. The transfer worker waits it before its
     # one-sided RDMA read so the read never races the copy (ViT->send corruption
     # hazard). None on CPU/no-CUDA.
-    copy_event: "torch.cuda.Event | None" = None
+    copy_event: "torch.npu.Event | None" = None
 
 
 @dataclasses.dataclass

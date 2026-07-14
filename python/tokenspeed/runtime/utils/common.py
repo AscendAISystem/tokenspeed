@@ -71,6 +71,7 @@ from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
+from tokenspeed.runtime.utils.device_utils import is_npu_available
 
 logger = logging.getLogger(__name__)
 
@@ -158,21 +159,22 @@ def get_available_gpu_memory(
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
     if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+        dev = get_device_module()
+        num_gpus = dev.device_count()
         if gpu_id >= num_gpus:
             raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
-        if torch.cuda.current_device() != gpu_id:
+        if dev.current_device() != gpu_id:
             logger.debug(
                 "Current device is not %s, but %s, which may cause useless "
                 "memory allocation for torch CUDA context.",
                 gpu_id,
-                torch.cuda.current_device(),
+                dev.current_device(),
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            dev.empty_cache()
+        free_gpu_memory, _ = dev.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -185,7 +187,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+    return get_device_module().is_available()
 
 
 class LayerFn(Protocol):
@@ -214,8 +216,9 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    dev = get_device_module()
+    if dev.is_available():
+        dev.manual_seed_all(seed)
 
 
 @dataclass
@@ -506,8 +509,9 @@ def broadcast_pyobj(
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
+    dev = get_device_module()
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        "cuda" if dev.is_available() and not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -631,7 +635,8 @@ def add_prometheus_middleware(app):
 
 
 def get_amdgpu_memory_capacity():
-    if not torch.cuda.is_available():
+    dev = get_device_module()
+    if not dev.is_available():
         raise RuntimeError(
             "No AMD GPU available. Ensure ROCm drivers and a ROCm-enabled "
             "PyTorch build are installed and accessible."
@@ -641,8 +646,8 @@ def get_amdgpu_memory_capacity():
     # (torch.cuda is reused for ROCm/HIP), and return the minimum in MiB so
     # the value matches the previous rocminfo-based implementation.
     memory_values = [
-        torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
-        for i in range(torch.cuda.device_count())
+        dev.get_device_properties(i).total_memory // (1024 * 1024)
+        for i in range(dev.device_count())
     ]
 
     if not memory_values:
@@ -671,13 +676,14 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # Fallback to mem_get_info() when failed to get memory capacity from nvidia-smi,
             # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
+            dev = get_device_module()
+            if dev.is_available():
                 logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to mem_get_info()."
                 )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
+                return dev.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -700,15 +706,17 @@ def print_warning_once(msg: str) -> None:
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.cuda.get_device_name(device_id)
+    dev = get_device_module()
+    if dev.is_available():
+        return dev.get_device_name(device_id)
 
     return ""
 
 
 @lru_cache(maxsize=8)
 def get_device(device_id: int | None = None) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    dev = get_device_module()
+    if dev.is_available():
         if device_id is None:
             return "cuda"
         return f"cuda:{device_id}"
@@ -821,8 +829,9 @@ class MultiprocessingSerializer:
 def debug_timing(func):
     def wrapper(*args, **kwargs):
         if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
+            dev = get_device_module()
+            tic = dev.Event(enable_timing=True)
+            toc = dev.Event(enable_timing=True)
             tic.record()
             result = func(*args, **kwargs)
             toc.record()
@@ -907,6 +916,20 @@ def set_cuda_arch():
 
     arch = f"{platform.arch_version.major}.{platform.arch_version.minor}"
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def set_device_arch():
+    """Set architecture-specific environment variables for the active device.
+
+    On NVIDIA: sets ``TORCH_CUDA_ARCH_LIST``.
+    On NPU: sets ``ASCEND_DEVICE_ID``.
+    """
+    platform = current_platform()
+    if platform.is_nvidia:
+        set_cuda_arch()
+    elif is_npu_available():
+        device_id = get_device_module().current_device()
+        os.environ.setdefault("ASCEND_DEVICE_ID", str(device_id))
 
 
 def next_power_of_2(n: int):

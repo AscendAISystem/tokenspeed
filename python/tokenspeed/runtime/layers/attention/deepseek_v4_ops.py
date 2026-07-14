@@ -389,7 +389,7 @@ def _write_fp8_ds_mla_cache_rows_capturable(
     scale_dim = deepseek_v4_swa_scale_dim(head_dim, rope_dim)
     slots = kv_slot_mapping[:num_rows].to(torch.int64)
     valid = valid[:num_rows] & (slots >= 0)
-    if not (slots.is_cuda and torch.cuda.is_current_stream_capturing()):
+    if not (slots.is_cuda and torch.npu.is_current_stream_capturing()):
         if not bool(valid.any()):
             return
         normed = normed[:num_rows][valid]
@@ -609,7 +609,7 @@ def _write_deepseek_v4_indexer_fp8_cache_capturable(
 
     slots = slot_mapping[:num_rows].to(torch.int64)
     valid = valid[:num_rows] & (slots >= 0)
-    if not (slots.is_cuda and torch.cuda.is_current_stream_capturing()):
+    if not (slots.is_cuda and torch.npu.is_current_stream_capturing()):
         if not bool(valid.any()):
             return
         rows = rows[valid]

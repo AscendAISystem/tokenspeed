@@ -73,11 +73,11 @@ IRIS_AR_RMSNORM_STATES: dict = {}
 
 
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
-    if torch.cuda.is_available():
-        with torch.cuda.device(gpu_id):
+    if torch.npu.is_available():
+        with torch.npu.device(gpu_id):
             if empty_cache:
-                torch.cuda.empty_cache()
-            free_gpu_memory, _ = torch.cuda.mem_get_info()
+                torch.npu.empty_cache()
+            free_gpu_memory, _ = torch.npu.mem_get_info()
             return free_gpu_memory / (1 << 30)
     return 0.0
 
@@ -119,7 +119,7 @@ class IrisRSAG(object):
 
         self.group = group
         self.rank_in_group = rank_in_group
-        self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = device or torch.device(f"cuda:{torch.npu.current_device()}")
         self.max_tokens = max_tokens
         self.hidden_size = hidden_size
         self.dtype = torch.bfloat16
@@ -131,11 +131,11 @@ class IrisRSAG(object):
             buf_bytes = max_tokens * hidden_size * self.dtype.itemsize
             heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
 
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
         self._in_buff = self._ctx.empty((max_tokens, hidden_size), dtype=self.dtype)
         self._out_buff = self._ctx.empty((max_tokens, hidden_size), dtype=self.dtype)
-        free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
         logger.info(
             "Iris RSAG symmetric-heap buffers allocated: %s GB",
             free_gpu_memory_begin - free_gpu_memory_after,
@@ -323,7 +323,7 @@ class IrisAllReduce(object):
         self.rank_in_group = rank_in_group
         self.max_numel = max_numel
         self.dtype = dtype
-        self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = device or torch.device(f"cuda:{torch.npu.current_device()}")
         self._config = config or _IrisConfig(
             block_size_m=32, block_size_n=64, all_reduce_distribution=1
         )
@@ -335,11 +335,11 @@ class IrisAllReduce(object):
             buf_bytes = max_numel * dtype.itemsize
             heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
 
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
         self._input_buf = self._ctx.zeros((max_numel,), dtype=dtype)
         self._output_buf = self._ctx.zeros((max_numel,), dtype=dtype)
-        free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
         logger.info(
             "Iris all-reduce symmetric-heap buffers allocated: %s GB",
             free_gpu_memory_begin - free_gpu_memory_after,
@@ -546,15 +546,15 @@ class IrisAllReduceResidualRMSNorm(object):
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim
         self.dtype = dtype
-        self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = device or torch.device(f"cuda:{torch.npu.current_device()}")
 
         if heap_size is None:
             buf_bytes = max_token_num * hidden_dim * dtype.itemsize
             heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_begin = _get_available_gpu_memory(torch.npu.current_device())
         self._ctx = _get_or_create_iris_context(heap_size)
         self._input_buf = self._ctx.zeros((max_token_num, hidden_dim), dtype=dtype)
-        free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
+        free_gpu_memory_after = _get_available_gpu_memory(torch.npu.current_device())
         logger.info(
             "Iris AR+RMSNorm symmetric-heap buffer allocated: %s GB",
             free_gpu_memory_begin - free_gpu_memory_after,
@@ -566,7 +566,7 @@ class IrisAllReduceResidualRMSNorm(object):
 
         self.persistent = persistent
         self._num_programs = (
-            torch.cuda.get_device_properties(self.device).multi_processor_count
+            torch.npu.get_device_properties(self.device).multi_processor_count
             if persistent
             else 0
         )

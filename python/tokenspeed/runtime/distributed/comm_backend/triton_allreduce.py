@@ -51,7 +51,7 @@ class TritonAllReduceBackend(CommBackend):
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
             max_numel=self._max_numel,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            device=torch.device(f"cuda:{torch.npu.current_device()}"),
         )
         self._instances[group] = state
         return state

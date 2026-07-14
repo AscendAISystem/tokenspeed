@@ -143,7 +143,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.npu_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
 from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -1956,7 +1956,7 @@ class _DeepseekV4TopKBuffer:
             or self.buffer.shape[1] != self.topk_tokens
         )
         if needs_alloc:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if torch.npu.is_available() and torch.npu.is_current_stream_capturing():
                 raise RuntimeError(
                     "DeepSeek V4 top-k buffer must be allocated before CUDA graph "
                     "capture"
@@ -2287,14 +2287,14 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return sf.float()
 
     def _check_runtime_supported(self) -> None:
-        if not torch.cuda.is_available():
+        if not torch.npu.is_available():
             raise NotImplementedError("DeepSeek V4 MegaMoE requires CUDA.")
         device = self.w13_weight.device
         if device.type != "cuda":
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE expert weights must be loaded on CUDA."
             )
-        if torch.cuda.get_device_capability(device)[0] != 10:
+        if torch.npu.get_device_capability(device)[0] != 10:
             raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
         if self.hidden_size % 128 != 0 or self.intermediate_size % 128 != 0:
             raise ValueError(
@@ -2346,7 +2346,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if deep_gemm is None:
             raise RuntimeError("DeepGEMM MegaMoE symbols are unavailable.")
         group = pg_manager.get_process_group("nccl", self.mapping.moe.tp_ep_group)
-        device = torch.cuda.current_device()
+        device = torch.npu.current_device()
         key = (
             id(group),
             device,
@@ -2423,7 +2423,7 @@ class DeepseekV4MoE(nn.Module):
         quant_config: QuantizationConfig | None,
         layer_index: int,
         prefix: str,
-        aux_stream: torch.cuda.Stream | None = None,
+        aux_stream: torch.npu.Stream | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -3321,7 +3321,7 @@ class DeepseekV4Attention(nn.Module):
         layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        aux_stream: torch.cuda.Stream | None = None,
+        aux_stream: torch.npu.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
         cache_layer_index: int | None = None,
     ) -> None:
@@ -3429,7 +3429,7 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.bmm_batch_size = self.num_local_groups
         # SM100 packs the FP8 output-proj scales as INT32 UE8M0 (fp8_einsum
         # recipe (1,1,128)); SM90 keeps FP32 block scales (recipe (1,128,128)).
-        self._o_tma_aligned = torch.cuda.get_device_capability()[0] >= 10
+        self._o_tma_aligned = torch.npu.get_device_capability()[0] >= 10
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3803,7 +3803,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        aux_stream: torch.cuda.Stream | None = None,
+        aux_stream: torch.npu.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
         cache_layer_index: int | None = None,
     ) -> None:
@@ -4005,7 +4005,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
-        self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.aux_stream = torch.npu.Stream() if torch.npu.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -4199,7 +4199,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         import gc
 
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.npu.empty_cache()
 
         self._warmup_mega_moe_jit()
         self._warmup_prefill_jit()
@@ -4224,7 +4224,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 max_num_tokens=module.max_num_tokens,
                 top_k=module.top_k,
                 hidden_size=module.hidden_size,
-                device=torch.device("cuda", torch.cuda.current_device()),
+                device=torch.device("cuda", torch.npu.current_device()),
                 transformed_l1_weights=module._transformed_l1_weights,
                 transformed_l2_weights=module._transformed_l2_weights,
                 symm_buffer=module.get_symm_buffer(),
@@ -4235,7 +4235,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def _warmup_prefill_jit(self) -> None:
         if deep_gemm is None:
             return
-        if torch.cuda.get_device_capability()[0] < 10:
+        if torch.npu.get_device_capability()[0] < 10:
             return
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1
@@ -4270,7 +4270,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # (continuous batching), the same ceiling mega_moe warms to. Hardcoding
             # 8192 would leave M in (8192, chunked_prefill_size] to JIT inline.
             max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
-            device=torch.device("cuda", torch.cuda.current_device()),
+            device=torch.device("cuda", torch.npu.current_device()),
         )
 
     def post_quant_warmup(self) -> None:

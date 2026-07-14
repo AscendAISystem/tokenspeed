@@ -61,7 +61,7 @@ class InputGenerator:
         self.dtype = dtype
         self.traits = traits
         self.format_signature = format_signature
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.npu.is_available() else "cpu")
 
         rng_device = "cuda" if self.device.startswith("cuda") else "cpu"
         self.rng = torch.Generator(device=rng_device).manual_seed(seed)

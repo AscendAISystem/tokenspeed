@@ -131,11 +131,11 @@ class PyNcclCommunicator:
         # nccl communicator and stream will use this device
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
-        with torch.cuda.device(device):
+        with torch.npu.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
             )
-            self.stream = torch.cuda.Stream()
+            self.stream = torch.npu.Stream()
 
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
@@ -173,7 +173,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     def all_gather(
@@ -193,7 +193,7 @@ class PyNcclCommunicator:
             input_tensor.numel(),
             ncclDataTypeEnum.from_torch(input_tensor.dtype),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     def reduce_scatter(
@@ -218,7 +218,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(input_tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
@@ -233,7 +233,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             dst,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
@@ -248,7 +248,7 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
@@ -271,12 +271,12 @@ class PyNcclCommunicator:
             ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
-            cudaStream_t(stream.cuda_stream),
+            cudaStream_t(stream.npu_stream),
         )
 
     @contextmanager
     def change_state(
-        self, enable: bool | None = None, stream: torch.cuda.Stream | None = None
+        self, enable: bool | None = None, stream: torch.npu.Stream | None = None
     ):
         """
         A context manager to change the state of the communicator.

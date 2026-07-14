@@ -18,24 +18,29 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 from contextlib import contextmanager
 
 import torch
 
+from tokenspeed.runtime.utils.device_utils import get_device_module
+
 
 class StreamFork:
-    def __init__(self, aux_stream: torch.cuda.Stream | None):
+    def __init__(self, aux_stream: torch.npu.Stream | torch.cuda.Stream | None):
         self.aux_stream = aux_stream
-        self.fork_event = torch.cuda.Event() if aux_stream is not None else None
-        self.join_event = torch.cuda.Event() if aux_stream is not None else None
+        self._dev = get_device_module()
+        self.fork_event = self._dev.Event() if aux_stream is not None else None
+        self.join_event = self._dev.Event() if aux_stream is not None else None
         self._active = False
-        self._current: torch.cuda.Stream | None = None
+        self._current: torch.npu.Stream | torch.cuda.Stream | None = None
 
     @contextmanager
     def scope(self, *, enable: bool):
         self._active = enable and self.aux_stream is not None
         if self._active:
-            self._current = torch.cuda.current_stream()
+            self._current = self._dev.current_stream()
             self.fork_event.record(self._current)
         try:
             yield self
@@ -50,7 +55,7 @@ class StreamFork:
         if not self._active:
             yield
             return
-        with torch.cuda.stream(self.aux_stream):
+        with self._dev.stream(self.aux_stream):
             self.fork_event.wait(self.aux_stream)
             yield
             self.join_event.record(self.aux_stream)

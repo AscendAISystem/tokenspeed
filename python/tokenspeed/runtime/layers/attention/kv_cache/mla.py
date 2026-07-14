@@ -139,7 +139,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
             self.device_module.Stream()
-            if torch.cuda.is_available() and enable_alt_stream
+            if torch.npu.is_available() and enable_alt_stream
             else None
         )
 
@@ -392,7 +392,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         kv_cache_cpu = []
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
@@ -410,13 +410,13 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                         "cpu", non_blocking=True
                     )
                     kv_cache_cpu[-1].append([kv_cpu])
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         return kv_cache_cpu
 
     def load_cpu_copy(
         self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
     ) -> None:
-        torch.cuda.synchronize()
+        torch.npu.synchronize()
         for layer_id in range(self.layer_num):
             for i in range(0, len(token_indices), self.offload_chunk_page_num):
                 chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
@@ -434,4 +434,4 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     ), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
                     kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                     self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        torch.cuda.synchronize()
+        torch.npu.synchronize()

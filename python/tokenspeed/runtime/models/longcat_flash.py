@@ -80,7 +80,7 @@ from tokenspeed.runtime.moe.expert_location import (
     ModelConfigForExpertLocation as _ModelConfigForExpertLocation,
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
-from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
+from tokenspeed.runtime.utils.npu_stream import StreamFork as _StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled as _pdl_enabled
 
@@ -205,7 +205,7 @@ class _RuntimeLongcatMoE(nn.Module):
         quant_config: _QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ):
         super().__init__()
         self.mapping = mapping
@@ -361,7 +361,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -598,7 +598,7 @@ class _RuntimeLongcatModel(nn.Module):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
         )
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.alt_stream = torch.npu.Stream() if torch.npu.is_available() else None
         self.layers = nn.ModuleList(
             [
                 _RuntimeLongcatDecoderLayer(
@@ -896,8 +896,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

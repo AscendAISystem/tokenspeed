@@ -34,6 +34,8 @@ from typing import Any
 
 import torch
 
+from tokenspeed.runtime.utils.device_utils import get_device_module, is_npu_available
+
 _ext = None
 _ext_lock = threading.Lock()
 
@@ -78,7 +80,7 @@ static void CUDART_CB host_func_trampoline(void* user_data) {
     // else: caller keeps the handle and frees it explicitly.
 }
 
-// stream_ptr: CUstream as uintptr_t (torch.cuda.Stream.cuda_stream)
+// stream_ptr: CUstream as uintptr_t (torch.npu.Stream.npu_stream)
 // free_user_data: True for non-capturing stream (safe to free after call);
 //                 False during capture (callback replays from the same
 //                 HostFuncUserData, so caller must keep it alive).
@@ -171,16 +173,29 @@ _USER_DATA_HANDLES: set[int] = set()
 
 
 def launch_hostfunc(fn: Callable, *args: Any, **kwargs: Any) -> int | None:
-    """Run ``fn(*args, **kwargs)`` on the current CUDA stream.
+    """Run ``fn(*args, **kwargs)`` on the current device stream.
 
     When capturing, returns a handle to the user-data the caller must keep
     alive; otherwise executes eagerly and returns None.
+
+    .. note::
+       This function uses CUDA's ``cudaLaunchHostFunc`` under the hood.
+       On NPU it currently falls through to eager execution (no graph
+       capture support) until a ``aclLaunchHostFunc`` equivalent is
+       available.
     """
-    stream = torch.cuda.current_stream()
-    is_capturing = torch.cuda.is_current_stream_capturing()
+    dev = get_device_module()
+    stream = dev.current_stream()
+    is_capturing = dev.is_current_stream_capturing()
+    if is_npu_available():
+        # NPU: execute eagerly — stream->synchronize() then call fn
+        # (no graph-capture host-func support yet).
+        stream.synchronize()
+        fn(*args, **kwargs)
+        return None
     ext = _load_ext()
     handle = ext.launch_hostfunc(
-        stream.cuda_stream, not is_capturing, fn, *args, **kwargs
+        stream.npu_stream, not is_capturing, fn, *args, **kwargs
     )
     if is_capturing:
         if handle is None:

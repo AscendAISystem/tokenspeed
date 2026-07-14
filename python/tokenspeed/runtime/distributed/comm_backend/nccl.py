@@ -67,7 +67,7 @@ class NcclBackend(CommBackend):
                 gloo_group = pg_manager.get_process_group("gloo", group)
                 pynccl_comm = PyNcclCommunicator(
                     group=gloo_group,
-                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                    device=torch.device(f"cuda:{torch.npu.current_device()}"),
                 )
             except Exception:
                 pynccl_comm = None

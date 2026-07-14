@@ -53,7 +53,7 @@ from tokenspeed.runtime.layers.moe.utils import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.npu_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -175,7 +175,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: torch.npu.Stream | None = None,
     ):
         super().__init__()
         self.mapping = mapping

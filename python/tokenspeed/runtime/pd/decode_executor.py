@@ -248,8 +248,8 @@ class DisaggDecodeExecutor:
         ).to(device, non_blocking=True)
         # HostTodevice segment ends
 
-        execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(execution_stream):
+        execution_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(execution_stream):
             if num_extends > 0:
                 runtime_states.reset_states(
                     extend_request_pool_indices, extend_prefix_lens

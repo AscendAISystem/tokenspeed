@@ -86,11 +86,11 @@ _RECV_POOL_QUARANTINE_S = 10.0
 _pending_dereg: deque = deque()
 
 
-def _record_current_stream_event(tensor: torch.Tensor) -> torch.cuda.Event | None:
+def _record_current_stream_event(tensor: torch.Tensor) -> torch.npu.Event | None:
     if not tensor.is_cuda:
         return None
-    event = torch.cuda.Event()
-    torch.cuda.current_stream(tensor.device).record_event(event)
+    event = torch.npu.Event()
+    torch.npu.current_stream(tensor.device).record_event(event)
     return event
 
 
@@ -966,7 +966,7 @@ class EpdPrefillAdmission:
             # customer request instead of at boot.
             warmup = torch.zeros(1, device=device)
             dist.broadcast(warmup, src=self._group_ranks[0], group=self._nccl_group)
-            torch.cuda.current_stream().synchronize()
+            torch.npu.current_stream().synchronize()
             logger.info(
                 "EPD embedding row-sharding enabled (attn_tp=%d, NCCL group warm)",
                 attn_tp_size,

@@ -144,7 +144,7 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
-    with torch.cuda.device(x.device.index):
+    with torch.npu.device(x.device.index):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,
