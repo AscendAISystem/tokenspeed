@@ -25,6 +25,12 @@ from datetime import timedelta
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
+from tokenspeed.runtime.utils.device_utils import is_npu_available
+
+
+def _get_default_backend() -> str:
+    """Return ``"hccl"`` on NPU platforms, ``"nccl"`` otherwise."""
+    return "hccl" if is_npu_available() else "nccl"
 
 
 def _make_all_groups(group: Group) -> list[Group]:
@@ -50,9 +56,11 @@ class ProcessGroupManager:
         self,
         mapping: Mapping,
         distributed_init_method: str = "env://",
-        backend: str = "nccl",
+        backend: str | None = None,
         timeout: int | None = None,
     ) -> None:
+        if backend is None:
+            backend = _get_default_backend()
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
@@ -92,7 +100,8 @@ class ProcessGroupManager:
         self, group: Group, backend: str | list[str] | None = None
     ) -> None:
         if backend is None:
-            backends = ["nccl", "gloo"]
+            default = _get_default_backend()
+            backends = [default, "gloo"]
         elif isinstance(backend, str):
             backends = [backend]
         else:

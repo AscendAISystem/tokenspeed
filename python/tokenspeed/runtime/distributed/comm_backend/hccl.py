@@ -18,34 +18,36 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""NCCL communication backend.
+"""HCCL communication backend for Ascend NPU.
 
-Looks up pre-created process groups from pg_manager. Optionally uses
-PyNccl communicators for better performance. Supports torch.compile
-via custom ops.
+Looks up pre-created process groups from pg_manager. Uses torch.distributed
+with the ``hccl`` backend. HCCL (Huawei Collective Communication Library)
+is the NPU counterpart of NCCL and shares the same torch.distributed API.
 """
 
 import torch
 import torch.distributed
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
-from tokenspeed.runtime.utils.device_utils import is_npu_available
 
 
-class NcclBackend(CommBackend):
-    """Backend using NCCL via PyNccl or torch.distributed.
+class HcclBackend(CommBackend):
+    """Backend using HCCL via torch.distributed on Ascend NPU.
 
-    Caches per-group resources (process group handle, PyNccl comm)
+    Caches per-group resources (process group handle)
     keyed by group tuple. Process groups are looked up from pg_manager
     on first use.
+
+    Note: PyNccl is CUDA-only and not available on NPU, so all operations
+    use torch.distributed directly.
     """
 
     def __init__(self):
-        self._resources = {}  # group_tuple → {pynccl_comm, device_group, world_size}
-        self._use_pynccl = False
+        self._resources = {}  # group_tuple → {device_group, world_size}
 
     def configure(self, use_pynccl: bool = False) -> None:
-        self._use_pynccl = use_pynccl
+        # PyNccl is not available on NPU; ignore configuration.
+        pass
 
     def _get_or_create_resources(self, group: Group):
         if group in self._resources:
@@ -55,26 +57,10 @@ class NcclBackend(CommBackend):
             process_group_manager as pg_manager,
         )
 
-        device_group = pg_manager.get_process_group("nccl", group)
+        device_group = pg_manager.get_process_group("hccl", group)
         world_size = len(group)
 
-        pynccl_comm = None
-        if self._use_pynccl and world_size > 1:
-            try:
-                from tokenspeed.runtime.distributed.device_communicators.pynccl import (
-                    PyNcclCommunicator,
-                )
-
-                gloo_group = pg_manager.get_process_group("gloo", group)
-                pynccl_comm = PyNcclCommunicator(
-                    group=gloo_group,
-                    device=torch.device(f"cuda:{torch.npu.current_device()}"),
-                )
-            except Exception:
-                pynccl_comm = None
-
         self._resources[group] = {
-            "pynccl_comm": pynccl_comm,
             "device_group": device_group,
             "world_size": world_size,
         }
@@ -88,11 +74,7 @@ class NcclBackend(CommBackend):
             return tensor
         if op is None:
             op = torch.distributed.ReduceOp.SUM
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.all_reduce(tensor, op=op)
-        else:
-            torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
+        torch.distributed.all_reduce(tensor, op=op, group=res["device_group"])
         return tensor
 
     def all_gather(
@@ -124,13 +106,9 @@ class NcclBackend(CommBackend):
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         res = self._get_or_create_resources(group)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.all_gather(output, input)
-        else:
-            torch.distributed.all_gather_into_tensor(
-                output, input, group=res["device_group"]
-            )
+        torch.distributed.all_gather_into_tensor(
+            output, input, group=res["device_group"]
+        )
 
     def all_to_all_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
@@ -140,7 +118,6 @@ class NcclBackend(CommBackend):
         if ws == 1:
             output.copy_(input)
             return
-        # PyNccl has no all_to_all wrapper
         torch.distributed.all_to_all_single(output, input, group=res["device_group"])
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
@@ -154,22 +131,14 @@ class NcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.reduce_scatter(output_tensor, tensor)
-        else:
-            torch.distributed.reduce_scatter_tensor(
-                output_tensor, tensor, group=res["device_group"]
-            )
+        torch.distributed.reduce_scatter_tensor(
+            output_tensor, tensor, group=res["device_group"]
+        )
         return output_tensor
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         res = self._get_or_create_resources(group)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.send(tensor, dst)
-        else:
-            torch.distributed.send(tensor, group[dst], group=res["device_group"])
+        torch.distributed.send(tensor, group[dst], group=res["device_group"])
 
     def recv(
         self,
@@ -181,11 +150,7 @@ class NcclBackend(CommBackend):
     ) -> torch.Tensor:
         res = self._get_or_create_resources(group)
         tensor = torch.empty(size, dtype=dtype, device=device)
-        pynccl = res["pynccl_comm"]
-        if pynccl is not None and not pynccl.disabled:
-            pynccl.recv(tensor, src)
-        else:
-            torch.distributed.recv(tensor, group[src], group=res["device_group"])
+        torch.distributed.recv(tensor, group[src], group=res["device_group"])
         return tensor
 
     def token_all_gather(
@@ -194,7 +159,7 @@ class NcclBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        """NCCL token_all_gather with padding for uneven token distribution.
+        """HCCL token_all_gather with padding for uneven token distribution.
 
         Pads each rank's slice to max_tokens rows, all-gathers, then strips padding.
         """
@@ -230,7 +195,7 @@ class NcclBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        """NCCL token_reduce_scatter with padding for uneven token distribution.
+        """HCCL token_reduce_scatter with padding for uneven token distribution.
 
         Pads the gathered tensor to a uniform layout, reduce-scatters, then strips padding.
         """
