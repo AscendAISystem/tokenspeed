@@ -348,8 +348,12 @@ def npu_mha_decode_with_kvcache(
             seq_lens_list = [int(s) for s in cache_seqlens]
             # NPU BNSD = [batch, num_heads, seqlen, head_dim]; transpose from BSND
             q_bnsd = q_4d.transpose(1, 2)
+            # NPU BnNBsD expects k/v as [num_pages, num_kv_heads, page_size, head_dim]
+            # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
+            k_bnsd = k_cache.transpose(1, 2)
+            v_bnsd = v_cache.transpose(1, 2)
             out, _ = fused_attn(
-                q_bnsd, k_cache, v_cache,
+                q_bnsd, k_bnsd, v_bnsd,
                 actual_seq_lengths=seq_lens_list,
                 actual_seq_lengths_kv=seq_lens_list,
                 num_heads=num_q_heads,
