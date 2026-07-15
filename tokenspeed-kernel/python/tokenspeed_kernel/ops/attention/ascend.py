@@ -337,7 +337,7 @@ def npu_mha_decode_with_kvcache(
 
     # Reshape q for batch processing
     # q is [batch * max_seqlen_q, num_heads, head_dim]
-    # -> [batch, max_seqlen_q, num_heads, head_dim] (BNSD layout)
+    # -> [batch, max_seqlen_q, num_heads, head_dim] (PyTorch BSND layout)
     q_4d = q.reshape(batch_size, max_seqlen_q, num_q_heads, head_dim)
 
     # Try to use NPU fused attention first (fast path), fall back to SDPA
@@ -346,8 +346,10 @@ def npu_mha_decode_with_kvcache(
         try:
             # For page attention, actual_seq_lengths_kv is mandatory per NPU API spec
             seq_lens_list = [int(s) for s in cache_seqlens]
+            # NPU BNSD = [batch, num_heads, seqlen, head_dim]; transpose from BSND
+            q_bnsd = q_4d.transpose(1, 2)
             out, _ = fused_attn(
-                q_4d, k_cache, v_cache,
+                q_bnsd, k_cache, v_cache,
                 actual_seq_lengths=seq_lens_list,
                 actual_seq_lengths_kv=seq_lens_list,
                 num_heads=num_q_heads,
