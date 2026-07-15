@@ -28,10 +28,13 @@ PyTorch SDPA path when the NPU-specific API is unavailable.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 from tokenspeed_kernel.platform import CapabilityRequirement
+
+logger = logging.getLogger(__name__)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -337,18 +340,24 @@ def npu_mha_decode_with_kvcache(
     # -> [batch, max_seqlen_q, num_heads, head_dim] (BNSD layout)
     q_4d = q.reshape(batch_size, max_seqlen_q, num_q_heads, head_dim)
 
+    # Try to use NPU fused attention first (fast path), fall back to SDPA
+    use_fused = False
     if fused_attn is not None:
-        out, _ = fused_attn(
-            q_4d, k_cache, v_cache,
-            actual_seq_lengths=[int(s) for s in cache_seqlens],
-            num_heads=num_q_heads,
-            scale=scale,
-            input_layout="BNSD",
-            block_table=page_table,
-            block_size=k_cache.shape[1],
-        )
-        out = out.reshape(-1, num_q_heads, head_dim)
-    else:
+        try:
+            out, _ = fused_attn(
+                q_4d, k_cache, v_cache,
+                actual_seq_lengths=[int(s) for s in cache_seqlens],
+                num_heads=num_q_heads,
+                scale=scale,
+                input_layout="BNSD",
+                block_table=page_table,
+                block_size=k_cache.shape[1],
+            )
+            out = out.reshape(-1, num_q_heads, head_dim)
+            use_fused = True
+        except RuntimeError as e:
+            logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
+    if not use_fused:
         # Fallback: SDPA decode
         k_contiguous = k_cache.reshape(-1, k_cache.shape[2], k_cache.shape[3])
         v_contiguous = v_cache.reshape(-1, v_cache.shape[2], v_cache.shape[3])
