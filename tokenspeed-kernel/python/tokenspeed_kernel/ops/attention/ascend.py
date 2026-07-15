@@ -344,10 +344,14 @@ def npu_mha_decode_with_kvcache(
     use_fused = False
     if fused_attn is not None:
         try:
+            # For page attention, actual_seq_lengths_kv is mandatory per NPU API spec
+            seq_lens_list = [int(s) for s in cache_seqlens]
             out, _ = fused_attn(
                 q_4d, k_cache, v_cache,
-                actual_seq_lengths=[int(s) for s in cache_seqlens],
+                actual_seq_lengths=seq_lens_list,
+                actual_seq_lengths_kv=seq_lens_list,
                 num_heads=num_q_heads,
+                num_key_value_heads=k_cache.shape[2],
                 scale=scale,
                 input_layout="BNSD",
                 block_table=page_table,

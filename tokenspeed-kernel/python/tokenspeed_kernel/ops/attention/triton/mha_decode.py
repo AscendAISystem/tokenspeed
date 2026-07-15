@@ -840,7 +840,7 @@ def decode_attention_fwd(
     "mha_decode_with_kvcache",
     name="triton_mha_decode_with_kvcache_cached",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "huawei"})),
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
     ),
