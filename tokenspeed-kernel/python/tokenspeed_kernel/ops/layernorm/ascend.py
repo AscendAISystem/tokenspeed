@@ -101,19 +101,30 @@ def rmsnorm(
     x_2d = x.reshape(-1, hidden_size)
     if out is None:
         out = torch.empty_like(x)
-    out_2d = out.reshape(-1, hidden_size)
+    # NOTE: out_2d is a VIEW of out. After tuple unpacking from add_rms_norm,
+    # out_2d gets reassigned to the returned result tensor. We capture the
+    # result in a separate variable and copy back if out was pre-allocated.
 
+    # Ensure weight dtype matches input dtype (NPU kernel requires matching dtypes)
+    weight_cast = weight.to(x.dtype) if weight.dtype != x.dtype else weight
+
+    out_prealloc = out is not None
     add_rms_norm = _get_npu_add_rms_norm()
     if add_rms_norm is not None and residual is not None:
         # npu_add_rms_norm(x, residual, weight, eps) -> (output, norm_scale, new_residual)
         residual_2d = residual.reshape(-1, hidden_size)
-        out_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight, eps)
+        result_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight_cast, eps)
+        if out_prealloc:
+            out.reshape(-1, hidden_size).copy_(result_2d)
         residual_out = residual_out_2d.reshape(residual.shape)
-        return out.reshape(x.shape), residual_out
+        return (out.reshape(x.shape) if out_prealloc else result_2d.reshape(x.shape)), residual_out
     elif add_rms_norm is not None:
         # Use npu_add_rms_norm without residual (returns output, norm_scale, updated_input)
-        out_2d, _, _ = add_rms_norm(x_2d, x_2d, weight, eps)
-        return out.reshape(x.shape)
+        result_2d, _, _ = add_rms_norm(x_2d, x_2d, weight_cast, eps)
+        if out_prealloc:
+            out.reshape(-1, hidden_size).copy_(result_2d)
+            return out.reshape(x.shape)
+        return result_2d.reshape(x.shape)
     else:
         # Fallback: F.rms_norm
         if residual is not None:
@@ -162,9 +173,12 @@ def fused_add_rmsnorm(
     x_2d = x.reshape(-1, hidden_size)
     residual_2d = residual.reshape(-1, hidden_size)
 
+    # Ensure weight dtype matches input dtype
+    weight_cast = weight.to(x.dtype) if weight.dtype != x.dtype else weight
+
     add_rms_norm = _get_npu_add_rms_norm()
     if add_rms_norm is not None:
-        out_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight, eps)
+        out_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight_cast, eps)
         out = out_2d.reshape(x.shape)
         residual_out = residual_out_2d.reshape(residual.shape)
     else:
