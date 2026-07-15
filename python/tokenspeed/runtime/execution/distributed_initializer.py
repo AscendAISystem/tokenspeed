@@ -140,6 +140,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 

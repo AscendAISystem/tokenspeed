@@ -30,9 +30,11 @@ logger = get_colorful_logger(__name__)
 class DeviceConfig:
     device: torch.device | None
 
-    def __init__(self, device: str = "cuda") -> None:
-        if device == "cuda":
+    def __init__(self, device: str = "auto") -> None:
+        if device in ("cuda", "npu"):
             self.device_type = device
+        elif device == "auto":
+            self.device_type = "npu" if torch.npu.is_available() else "cuda"
         else:
             raise RuntimeError(f"Not supported device type: {device}")
         self.device = torch.device(self.device_type)

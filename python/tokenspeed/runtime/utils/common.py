@@ -158,7 +158,7 @@ def get_available_gpu_memory(
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == "cuda":
+    if device in ("cuda", "npu"):
         dev = get_device_module()
         num_gpus = dev.device_count()
         if gpu_id >= num_gpus:
