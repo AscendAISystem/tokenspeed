@@ -23,6 +23,94 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
+_NPU_AVAILABLE: bool | None = None
+
+
+def _is_npu_available() -> bool:
+    global _NPU_AVAILABLE
+    if _NPU_AVAILABLE is None:
+        _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+    return _NPU_AVAILABLE
+
+
+def _packed_qkv_complex_rotary_npu(
+    qkv: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+    num_heads: int,
+    head_dim: int,
+    freqs_cis: torch.Tensor,
+    *,
+    copy_v: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NPU fallback for complex RoPE using torch.view_as_complex."""
+    qkv_flat = qkv.reshape(-1, qkv.shape[-1])
+    total_tokens = qkv_flat.shape[0]
+    assert head_dim % 2 == 0
+    assert freqs_cis.is_complex()
+
+    q_view = qkv_flat[:, :q_size].reshape(total_tokens, num_heads, head_dim)
+    k_view = qkv_flat[:, q_size:q_size + kv_size].reshape(total_tokens, num_heads, head_dim)
+
+    # Pair up consecutive dims and view as complex
+    q_complex = torch.view_as_complex(q_view.float().reshape(total_tokens, num_heads, -1, 2))
+    k_complex = torch.view_as_complex(k_view.float().reshape(total_tokens, num_heads, -1, 2))
+
+    # Complex multiply: freqs_cis has shape [total_tokens, head_dim/2]
+    freqs = freqs_cis.unsqueeze(1)  # [total_tokens, 1, head_dim/2]
+    q_rot = q_complex * freqs
+    k_rot = k_complex * freqs
+
+    q_out = torch.view_as_real(q_rot).flatten(-2).to(qkv.dtype)
+    k_out = torch.view_as_real(k_rot).flatten(-2).to(qkv.dtype)
+
+    if copy_v:
+        v_view = qkv_flat[:, q_size + kv_size:q_size + 2 * kv_size]
+        v_out = v_view.reshape(total_tokens, num_heads, head_dim).to(qkv.dtype)
+    else:
+        v_view = qkv_flat[:, q_size + kv_size:q_size + 2 * kv_size]
+        v_out = v_view.reshape(total_tokens, num_heads, head_dim)
+
+    return q_out, k_out, v_out
+
+
+def _packed_qkv_neox_rotary_npu(
+    qkv: torch.Tensor,
+    q_size: int,
+    kv_size: int,
+    num_heads: int,
+    head_dim: int,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    copy_v: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NPU fallback for NeoX-style RoPE using PyTorch."""
+    qkv_flat = qkv.reshape(-1, qkv.shape[-1])
+    total_tokens = qkv_flat.shape[0]
+
+    q_view = qkv_flat[:, :q_size].reshape(total_tokens, num_heads, head_dim)
+    k_view = qkv_flat[:, q_size:q_size + kv_size].reshape(total_tokens, num_heads, head_dim)
+
+    half = head_dim // 2
+    # Rotate half: swap halves and negate the first half
+    q_rot = torch.cat([-q_view[..., half:], q_view[..., :half]], dim=-1)
+    k_rot = torch.cat([-k_view[..., half:], k_view[..., :half]], dim=-1)
+
+    q_out = q_view.float() * cos.unsqueeze(1) + q_rot.float() * sin.unsqueeze(1)
+    k_out = k_view.float() * cos.unsqueeze(1) + k_rot.float() * sin.unsqueeze(1)
+    q_out = q_out.to(qkv.dtype)
+    k_out = k_out.to(qkv.dtype)
+
+    if copy_v:
+        v_view = qkv_flat[:, q_size + kv_size:q_size + 2 * kv_size]
+        v_out = v_view.reshape(total_tokens, num_heads, head_dim).to(qkv.dtype)
+    else:
+        v_view = qkv_flat[:, q_size + kv_size:q_size + 2 * kv_size]
+        v_out = v_view.reshape(total_tokens, num_heads, head_dim)
+
+    return q_out, k_out, v_out
+
 
 @triton.jit
 def _packed_qkv_complex_rotary_kernel(
@@ -130,6 +218,12 @@ def packed_qkv_complex_rotary(
     assert kv_size == num_heads * head_dim
     assert freqs_cis.shape == (total_tokens, head_dim // 2)
     assert freqs_cis.is_complex()
+
+    # NPU fallback: use torch.view_as_complex
+    if _is_npu_available():
+        return _packed_qkv_complex_rotary_npu(
+            qkv, q_size, kv_size, num_heads, head_dim, freqs_cis, copy_v=copy_v,
+        )
 
     q_out = torch.empty(
         (total_tokens, num_heads, head_dim), device=qkv.device, dtype=qkv.dtype
@@ -304,6 +398,12 @@ def packed_qkv_neox_rotary(
     assert kv_size == num_heads * head_dim
     assert cos.shape == (total_tokens, head_dim)
     assert sin.shape == (total_tokens, head_dim)
+
+    # NPU fallback: use PyTorch implementation of NeoX rotary
+    if _is_npu_available():
+        return _packed_qkv_neox_rotary_npu(
+            qkv, q_size, kv_size, num_heads, head_dim, cos, sin, copy_v=copy_v,
+        )
 
     q_out = torch.empty(
         (total_tokens, num_heads, head_dim), device=qkv.device, dtype=qkv.dtype

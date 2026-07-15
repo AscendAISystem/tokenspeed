@@ -26,6 +26,36 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+_NPU_AVAILABLE: bool | None = None
+
+
+def _is_npu_available() -> bool:
+    global _NPU_AVAILABLE
+    if _NPU_AVAILABLE is None:
+        _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+    return _NPU_AVAILABLE
+
+
+def _hadamard_128_npu(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Pure PyTorch Walsh-Hadamard transform for last dim 128 (NPU fallback).
+
+    Uses the iterative butterfly algorithm: for stride in [1,2,4,8,16,32,64],
+    pair elements at distance stride and compute (a+b, a-b).
+    """
+    shape = x.shape
+    x_f = x.reshape(-1, 128).float()
+    n = 128
+    stride = 1
+    while stride < n:
+        # Reshape to group pairs at distance `stride`
+        x_f = x_f.reshape(-1, n // (stride * 2), stride * 2)
+        a = x_f[:, :, :stride]
+        b = x_f[:, :, stride:2 * stride]
+        x_f = torch.cat([a + b, a - b], dim=-1)
+        x_f = x_f.reshape(-1, n)
+        stride *= 2
+    return (x_f * scale).reshape(shape).to(x.dtype)
+
 
 @triton.jit
 def _hadamard_128_kernel(
@@ -82,12 +112,19 @@ def triton_hadamard_transform_128(
         raise ValueError(
             f"triton_hadamard_transform_128 requires last dim 128, got {x.shape[-1]}"
         )
-    if not x.is_cuda:
-        raise RuntimeError("triton_hadamard_transform_128 requires a CUDA tensor")
     if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(
             f"triton_hadamard_transform_128 does not support dtype {x.dtype}"
         )
+
+    # NPU fallback: use pure PyTorch Hadamard
+    if _is_npu_available():
+        if not hasattr(torch, "npu") or not torch.npu.is_available():
+            raise RuntimeError("triton_hadamard_transform_128 requires NPU device")
+        return _hadamard_128_npu(x, scale=scale)
+
+    if not x.is_cuda:
+        raise RuntimeError("triton_hadamard_transform_128 requires a CUDA tensor")
 
     shape = x.shape
     x_2d = x.reshape(-1, 128).contiguous()

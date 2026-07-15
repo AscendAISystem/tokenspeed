@@ -26,6 +26,47 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+_NPU_AVAILABLE: bool | None = None
+
+
+def _is_npu_available() -> bool:
+    global _NPU_AVAILABLE
+    if _NPU_AVAILABLE is None:
+        _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+    return _NPU_AVAILABLE
+
+
+def _merge_state_npu(
+    out_a: torch.Tensor,
+    lse_a: torch.Tensor,
+    out_b: torch.Tensor,
+    lse_b: torch.Tensor,
+    lse_scale_log2: float,
+    inplace: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NPU fallback for attention merge state using pure PyTorch."""
+    out = out_a if inplace else torch.empty_like(out_a)
+    lse = lse_a if inplace else torch.empty_like(lse_a)
+    lse_a_log2 = lse_a.float() * lse_scale_log2
+    lse_b_log2 = lse_b.float() * lse_scale_log2
+    lse_max_log2 = torch.maximum(lse_a_log2, lse_b_log2)
+    weight_a = torch.exp2(lse_a_log2 - lse_max_log2)
+    weight_b = torch.exp2(lse_b_log2 - lse_max_log2)
+    denom = weight_a + weight_b
+    # Reshape weights for broadcasting over head_dim
+    weight_a_reshape = weight_a.reshape(-1, 1)
+    weight_b_reshape = weight_b.reshape(-1, 1)
+    out_flat = out.reshape(-1, out.shape[-1])
+    out_a_flat = out_a.reshape(-1, out_a.shape[-1])
+    out_b_flat = out_b.reshape(-1, out_b.shape[-1])
+    out_flat.copy_(
+        (out_a_flat.float() * weight_a_reshape + out_b_flat.float() * weight_b_reshape)
+        / denom.reshape(-1, 1)
+    )
+    merged_lse = (lse_max_log2 + torch.log2(denom)) / lse_scale_log2
+    lse.copy_(merged_lse.to(lse.dtype))
+    return out, lse
+
 
 @triton.jit
 def attn_merge_state_kernel(
@@ -86,6 +127,13 @@ def triton_attn_merge_state(
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del enable_pdl
+
+    # NPU fallback: use pure PyTorch merge
+    if _is_npu_available():
+        return _merge_state_npu(
+            out_a, lse_a, out_b, lse_b, lse_scale_log2, inplace=inplace,
+        )
+
     out = out_a if inplace else torch.empty_like(out_a)
     lse = lse_a if inplace else torch.empty_like(lse_a)
     total_rows = out_a.shape[0] * out_a.shape[1]

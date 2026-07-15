@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
@@ -36,6 +37,15 @@ _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 
 _is_nvidia = current_platform().is_nvidia
+
+_NPU_AVAILABLE: bool | None = None
+
+
+def _is_npu_available() -> bool:
+    global _NPU_AVAILABLE
+    if _NPU_AVAILABLE is None:
+        _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+    return _NPU_AVAILABLE
 
 __all__ = [
     "fused_fp8_set_kv_buffer",
@@ -46,6 +56,119 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
 ]
+
+
+# -----------------------------------------------------------------------------
+# NPU Fallback Helpers
+# -----------------------------------------------------------------------------
+
+
+def _store_kv_cache_npu(
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_dst: torch.Tensor,
+    v_dst: torch.Tensor,
+    loc: torch.Tensor,
+) -> None:
+    """NPU fallback for store_kv_cache using torch.index_copy."""
+    loc = loc.to(torch.int64).flatten()
+    k_dst.index_copy_(0, loc, k_src)
+    v_dst.index_copy_(0, loc, v_src)
+
+
+def _gather_page_table_with_padding_npu(
+    req_to_page: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    bs: int,
+    max_num_pages: int,
+    page_size: int,
+    dummy_slot: int = 0,
+) -> None:
+    """NPU fallback for gather_page_table_with_padding using index_select + pad."""
+    gathered = torch.index_select(
+        req_to_page, 0, req_pool_indices[:bs].to(torch.int64)
+    )
+    n_pages = torch.ceil(seq_lens[:bs].float() / page_size).long().unsqueeze(-1)
+    col_indices = torch.arange(max_num_pages, device=out.device).unsqueeze(0).expand(bs, -1)
+    valid_mask = col_indices < n_pages
+    if gathered.shape[1] < max_num_pages:
+        pad_len = max_num_pages - gathered.shape[1]
+        gathered = F.pad(gathered, (0, pad_len), value=dummy_slot)
+    out[:bs] = torch.where(valid_mask, gathered[:, :max_num_pages], dummy_slot)
+
+
+def _transfer_kv_per_layer_npu(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+) -> None:
+    """NPU fallback for per-layer KV transfer using index_select."""
+    element_dim = item_size // src_k.element_size()
+    k_src_flat = src_k.reshape(-1, element_dim)
+    v_src_flat = src_v.reshape(-1, element_dim)
+    k_dst_flat = dst_k.reshape(-1, element_dim)
+    v_dst_flat = dst_v.reshape(-1, element_dim)
+    src_idx = src_indices.to(torch.int64)
+    dst_idx = dst_indices.to(torch.int64)
+    k_dst_flat.index_copy_(0, dst_idx, k_src_flat.index_select(0, src_idx))
+    v_dst_flat.index_copy_(0, dst_idx, v_src_flat.index_select(0, src_idx))
+
+
+def _transfer_kv_per_layer_mla_npu(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+) -> None:
+    """NPU fallback for MLA per-layer transfer."""
+    element_dim = item_size // src.element_size()
+    src_flat = src.reshape(-1, element_dim)
+    dst_flat = dst.reshape(-1, element_dim)
+    src_idx = src_indices.to(torch.int64)
+    dst_idx = dst_indices.to(torch.int64)
+    dst_flat.index_copy_(0, dst_idx, src_flat.index_select(0, src_idx))
+
+
+def _fused_fp8_set_kv_buffer_npu(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_loc: torch.Tensor,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
+    page_size: int = 16,
+) -> None:
+    """NPU fallback for fused_fp8_set_kv_buffer using pure torch ops."""
+    num_tokens = k.shape[0]
+    if num_tokens == 0:
+        return
+
+    loc = cache_loc.to(torch.int64)
+    if k_cache.ndim == 4:
+        page_id = loc // page_size
+        page_offset = loc % page_size
+        if k_scale is not None and v_scale is not None:
+            k_cache[page_id, page_offset] = (k / k_scale).to(k_cache.dtype)
+            v_cache[page_id, page_offset] = (v / v_scale).to(v_cache.dtype)
+        else:
+            k_cache[page_id, page_offset] = k.to(k_cache.dtype)
+            v_cache[page_id, page_offset] = v.to(v_cache.dtype)
+    else:
+        if k_scale is not None and v_scale is not None:
+            k_cache[loc] = (k / k_scale).to(k_cache.dtype)
+            v_cache[loc] = (v / v_scale).to(v_cache.dtype)
+        else:
+            k_cache[loc] = k.to(k_cache.dtype)
+            v_cache[loc] = v.to(v_cache.dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -117,6 +240,11 @@ def store_kv_cache(
     ), f"k/v must share per-token element count, got {n_kv_k} vs {n_kv_v}"
     assert k_src.stride(-1) == 1 and v_src.stride(-1) == 1
     assert k_dst.stride(-1) == 1 and v_dst.stride(-1) == 1
+
+    # NPU fallback: use index_copy_
+    if _is_npu_available():
+        _store_kv_cache_npu(k_src, v_src, k_dst, v_dst, loc)
+        return
 
     k_src_stride = k_src.stride(0) if k_src.dim() > 1 else k_src.shape[-1]
     v_src_stride = v_src.stride(0) if v_src.dim() > 1 else v_src.shape[-1]
@@ -324,6 +452,14 @@ def fused_fp8_set_kv_buffer(
     if num_tokens == 0:
         return
 
+    # NPU fallback: use pure torch ops
+    if _is_npu_available():
+        _fused_fp8_set_kv_buffer_npu(
+            k, v, k_cache, v_cache, cache_loc,
+            k_scale=k_scale, v_scale=v_scale, page_size=page_size,
+        )
+        return
+
     if k_cache.ndim == 3:
         total_slots, num_kv_heads, head_dim = k_cache.shape
         assert (
@@ -492,6 +628,15 @@ def gather_page_table_with_padding(
         page_size: Number of tokens per page.
         dummy_slot: Value written into padding columns.
     """
+    # NPU fallback: use index_select + pad
+    if _is_npu_available():
+        _gather_page_table_with_padding_npu(
+            req_to_page, req_pool_indices, seq_lens, out,
+            bs=bs, max_num_pages=max_num_pages, page_size=page_size,
+            dummy_slot=dummy_slot,
+        )
+        return
+
     block_cols = 128
     grid = (bs, triton.cdiv(max_num_pages, block_cols))
     _gather_page_table_with_padding_kernel[grid](
@@ -793,6 +938,13 @@ def transfer_kv_per_layer(
     if length == 0:
         return
 
+    # NPU fallback: use index_copy_
+    if _is_npu_available():
+        _transfer_kv_per_layer_npu(
+            src_k, dst_k, src_v, dst_v, src_indices, dst_indices, item_size,
+        )
+        return
+
     # Flatten to 2D view: [num_slots, element_dim]
     k_cache_src_flat = src_k.view(-1, element_dim)
     v_cache_src_flat = src_v.view(-1, element_dim)
@@ -930,6 +1082,13 @@ def transfer_kv_per_layer_mla(
     if length == 0:
         return
 
+    # NPU fallback: use index_copy_
+    if _is_npu_available():
+        _transfer_kv_per_layer_mla_npu(
+            src, dst, src_indices, dst_indices, item_size,
+        )
+        return
+
     cache_src_flat = src.view(-1, element_dim)
     cache_dst_flat = dst.view(-1, element_dim)
     block_size = _next_power_of_two(element_dim)
@@ -966,6 +1125,21 @@ def transfer_kv_all_layer_mla(
             "Triton MLA all-layer kernel requires item_size to be a multiple of "
             "4 bytes."
         )
+
+    # NPU fallback: use per-layer MLA transfer in a loop
+    if _is_npu_available():
+        for layer in range(num_layers):
+            src_ptr_val = int(src_layers[layer].item())
+            dst_ptr_val = int(dst_layers[layer].item())
+            if src_ptr_val == 0 or dst_ptr_val == 0:
+                continue
+            # Create wrappers around the raw data pointers for index_copy_
+            # NPU: fall back to per-layer calls (caller should use per-layer API)
+            raise NotImplementedError(
+                "transfer_kv_all_layer_mla is not supported on NPU. "
+                "Use transfer_kv_per_layer_mla in a loop instead."
+            )
+        return
 
     words_per_chunk = 32
     total_words = item_size // 4
@@ -1026,6 +1200,13 @@ def transfer_kv_all_layer(
     if item_size % 4 != 0:
         raise ValueError(
             "Triton KV cache all-layer kernel requires item_size to be a multiple of 4 bytes."
+        )
+
+    # NPU: all-layer kernel uses device pointer tensors which are CUDA-specific
+    if _is_npu_available():
+        raise NotImplementedError(
+            "transfer_kv_all_layer is not supported on NPU. "
+            "Use transfer_kv_per_layer in a loop instead."
         )
 
     words_per_chunk = 32
