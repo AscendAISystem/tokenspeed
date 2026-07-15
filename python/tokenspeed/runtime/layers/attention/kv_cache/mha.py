@@ -34,6 +34,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.utils import (
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import debug_timing, get_colorful_logger
+from tokenspeed.runtime.utils.device_utils import is_npu_available
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
@@ -156,9 +157,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
+            ptr_dtype = torch.int64 if is_npu_available() else torch.uint64
             self.data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.k_buffer + self.v_buffer],
-                dtype=torch.int64,
+                dtype=ptr_dtype,
                 device=self.device,
             )
             self.data_strides = torch.tensor(
