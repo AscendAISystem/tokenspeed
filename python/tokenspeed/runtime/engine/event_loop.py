@@ -376,7 +376,7 @@ class EventLoop:
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
-            scheduler_cfg.page_size,
+            scheduler_cfg.block_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
