@@ -119,9 +119,10 @@ def npu_mha_prefill(
     scale = 1.0 / math.sqrt(head_dim)
 
     # Reshape q/k/v: [total, heads, dim] -> [1, heads, total, dim] (BNSD layout)
-    q_4d = q.unsqueeze(0)  # [1, total_q, num_heads, head_dim]
-    k_4d = k.unsqueeze(0)
-    v_4d = v.unsqueeze(0)
+    # q.unsqueeze(0) -> [1, total_q, num_heads, head_dim]; transpose to BNSD
+    q_4d = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_q, head_dim]
+    k_4d = k.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_kv, head_dim]
+    v_4d = v.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_kv, head_dim]
 
     # Build per-batch sequence lengths from cu_seqlens
     batch_size = cu_seqlens.shape[0] - 1
@@ -141,7 +142,9 @@ def npu_mha_prefill(
             input_layout="BNSD",
             sparse_mode=sparse_mode,
         )
-        out = out.squeeze(0)  # [total_q, num_heads, head_dim]
+        # out from NPU: [batch, num_heads, total_q, head_dim]; squeeze batch then
+        # transpose back to [total_q, num_heads, head_dim]
+        out = out.squeeze(0).transpose(0, 1)  # [total_q, num_heads, head_dim]
     else:
         # Fallback: use PyTorch SDPA when NPU API is unavailable
         out = torch.nn.functional.scaled_dot_product_attention(
