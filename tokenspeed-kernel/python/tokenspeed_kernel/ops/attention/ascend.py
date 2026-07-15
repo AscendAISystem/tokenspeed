@@ -362,16 +362,51 @@ def npu_mha_decode_with_kvcache(
         except RuntimeError as e:
             logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
     if not use_fused:
-        # Fallback: SDPA decode
-        k_contiguous = k_cache.reshape(-1, k_cache.shape[2], k_cache.shape[3])
-        v_contiguous = v_cache.reshape(-1, v_cache.shape[2], v_cache.shape[3])
-        q_2d = q.reshape(-1, 1, num_q_heads, head_dim)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_2d.transpose(1, 2),
-            k_contiguous.unsqueeze(0).transpose(1, 2),
-            v_contiguous.unsqueeze(0).transpose(1, 2),
-            scale=scale,
-        ).transpose(1, 2).squeeze(0)
+        # Fallback: SDPA decode with proper page table gathering
+        # k_cache shape: [num_pages, page_size, num_kv_heads, head_dim]
+        num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
+        batch_size = page_table.shape[0]
+        # Gather KV cache using page table
+        # page_table: [batch_size, max_pages_per_seq] with page indices
+        max_pages_per_seq = page_table.shape[1]
+        total_kv_tokens = int(cache_seqlens.sum().item())
+        # For simplicity, handle single-batch decode (most common case for bs=1)
+        if batch_size == 1:
+            num_kv = int(cache_seqlens[0].item())
+            pages = page_table[0, :(num_kv + page_size - 1) // page_size]
+            gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+            gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+            # q shape: [batch * max_seqlen_q, num_q_heads, head_dim], max_seqlen_q=1 for decode
+            q_2d = q.reshape(1, -1, num_q_heads, head_dim)  # [1, num_q_heads, 1, head_dim]
+            k_2d = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+            v_2d = gathered_v.unsqueeze(0)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q_2d.transpose(1, 2),
+                k_2d.transpose(1, 2),
+                v_2d.transpose(1, 2),
+                scale=scale,
+            ).transpose(1, 2).squeeze(0)
+        else:
+            # Multi-batch: process each batch separately
+            outputs = []
+            offset = 0
+            for b in range(batch_size):
+                num_kv = int(cache_seqlens[b].item())
+                pages = page_table[b, :(num_kv + page_size - 1) // page_size]
+                gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                q_b = q[offset:offset + max_seqlen_q].reshape(1, max_seqlen_q, num_q_heads, head_dim)
+                k_b = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+                v_b = gathered_v.unsqueeze(0)
+                out_b = torch.nn.functional.scaled_dot_product_attention(
+                    q_b.transpose(1, 2),
+                    k_b.transpose(1, 2),
+                    v_b.transpose(1, 2),
+                    scale=scale,
+                ).transpose(1, 2).squeeze(0)
+                outputs.append(out_b)
+                offset += max_seqlen_q
+            out = torch.cat(outputs, dim=0)
 
     if return_lse:
         lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
