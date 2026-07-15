@@ -68,7 +68,7 @@ def _get_npu_rotary_embedding():
     traits={
         "partial_rotary": frozenset({True, False}),
         "is_neox": frozenset({True, False}),
-        "has_fused_kv": frozenset({False}),
+        "has_fused_kv": frozenset({True, False}),
         "has_q_out": frozenset({True, False}),
         "has_k_out": frozenset({True, False}),
     },
@@ -104,8 +104,6 @@ def npu_embedding_rope(
     del enable_pdl
     if not _is_npu_available():
         raise RuntimeError("NPU not available")
-    if fused_set_kv_buffer_arg is not None:
-        raise ValueError("fused KV-cache write is not supported in the NPU RoPE backend")
 
     rotary_dim = cos_sin_cache.shape[-1]
     assert rotary_dim % 2 == 0, "rotary_dim must be even"
@@ -148,6 +146,27 @@ def npu_embedding_rope(
     else:
         # Pure PyTorch fallback
         _fallback_rope(q_3d, k_3d, q_out_3d, k_out_3d, positions, cos_sin_cache, head_size, rotary_dim, is_neox)
+
+    # Fused KV-cache write: write rotated K and original V into KV cache buffers
+    if fused_set_kv_buffer_arg is not None:
+        if (fused_set_kv_buffer_arg.k_scale is not None
+                or fused_set_kv_buffer_arg.v_scale is not None):
+            raise ValueError("k_scale/v_scale are not supported in NPU RoPE backend")
+        if fused_set_kv_buffer_arg.cache_loc is None:
+            raise ValueError("fused_set_kv_buffer_arg.cache_loc is required")
+
+        cache_loc = fused_set_kv_buffer_arg.cache_loc
+        value = fused_set_kv_buffer_arg.value  # V tensor
+        # Write rotated K into KV cache
+        k_buffer_view = fused_set_kv_buffer_arg.k_buffer.view(
+            fused_set_kv_buffer_arg.k_buffer.shape[0], num_kv_heads, head_size
+        )
+        k_buffer_view[cache_loc] = k_out_3d
+        # Write V into KV cache
+        v_buffer_view = fused_set_kv_buffer_arg.v_buffer.view(
+            fused_set_kv_buffer_arg.v_buffer.shape[0], num_kv_heads, head_size
+        )
+        v_buffer_view[cache_loc] = value.view(num_tokens, num_kv_heads, head_size)
 
 
 # ---------------------------------------------------------------------------
