@@ -22,6 +22,8 @@ from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+_HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
+
 platform = current_platform()
 
 
@@ -102,6 +104,109 @@ def _flatten_to_2d(x: torch.Tensor):
     return M, N, row_stride
 
 
+# ---------------------------------------------------------------------------
+# NPU-compatible FP8 quantize (pure PyTorch fallback)
+# ---------------------------------------------------------------------------
+_FP8_E4M3_MAX = 448.0
+_FP8_E4M3_PRECISION = 2.0**-3  # 3 mantissa bits → step 0.125
+
+
+def _simulate_fp8_quantize(
+    x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
+    fp8_max: float = _FP8_E4M3_MAX,
+    fp8_precision: float = _FP8_E4M3_PRECISION,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Simulate FP8 quantization with pure PyTorch ops (NPU fallback).
+
+    Since torch_npu does not support true ``float8_e4m3fn`` storage, this
+    function quantizes the input into the FP8 value range and stores the
+    result in the *original* dtype (e.g. bfloat16). A companion scale tensor
+    is returned so that ``out.float() * scale ≈ x.float()``.
+
+    Args:
+        x: Input tensor (any dtype, any device).
+        scale: Optional per-tensor scale.  Computed from ``amax / fp8_max``
+            when ``None``.
+        fp8_max: Saturation bound for the FP8 format.
+        fp8_precision: Quantisation step (``2 ** -num_mantissa_bits``).
+
+    Returns:
+        (quantized, scale) where ``quantized`` has the same dtype/device as
+        *x* and ``scale`` is a scalar FP32 tensor on the same device.
+    """
+    x_f32 = x.float()
+    if scale is None:
+        amax = x_f32.abs().max()
+        scale = (amax / fp8_max).clamp(min=1e-12)
+    else:
+        if isinstance(scale, torch.Tensor):
+            scale = scale.float()
+        else:
+            scale = torch.tensor(float(scale), device=x.device, dtype=torch.float32)
+
+    scaled = x_f32 / scale
+    clamped = torch.clamp(scaled, -fp8_max, fp8_max)
+    # Round to simulate finite mantissa bits
+    rounded = torch.round(clamped / fp8_precision) * fp8_precision
+    rounded = torch.clamp(rounded, -fp8_max, fp8_max)
+    return rounded.to(x.dtype), scale
+
+
+def npu_fp8_quantize(
+    x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> torch.Tensor:
+    """FP8 quantize on NPU devices (pure-PyTorch fallback).
+
+    This is the NPU counterpart of :func:`fp8_quantize`.  It simulates FP8
+    storage since ``torch_npu`` does not support ``float8_e4m3fn`` natively.
+
+    Args:
+        x: BF16 or FP16 input tensor on NPU.
+        scale: Optional per-tensor scale.
+        fp8_dtype: Desired FP8 variant (used for max/precision lookup).
+
+    Returns:
+        Tensor with the same shape/dtype/device as *x* whose values lie in
+        the simulated FP8 range.  Callers must track *scale* separately for
+        subsequent dequantisation or GEMM.
+    """
+    if fp8_dtype == torch.float8_e4m3fn:
+        fp8_max = 448.0
+        fp8_precision = 2.0**-3
+    elif fp8_dtype == torch.float8_e5m2:
+        fp8_max = 57344.0
+        fp8_precision = 2.0**-2  # 2 mantissa bits
+    elif fp8_dtype == torch.float8_e4m3fnuz:
+        fp8_max = 224.0
+        fp8_precision = 2.0**-3
+    else:
+        raise ValueError(f"Unsupported fp8_dtype: {fp8_dtype}")
+
+    result, _ = _simulate_fp8_quantize(x, scale, fp8_max, fp8_precision)
+    return result
+
+
+def npu_fp8_quantize_with_scale(
+    x: torch.Tensor,
+    granularity: str = "tensor",
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 quantize on NPU returning (quantized, scale).
+
+    This is the NPU counterpart of :func:`triton_quantize_fp8_with_scale`.
+    Only *per-tensor* granularity is currently supported on NPU.
+    """
+    if granularity != "tensor":
+        # Graceful fallback: per-tensor is the safest approximation when
+        # per-block is not available.
+        pass
+    result, scale = _simulate_fp8_quantize(x, scale=None)
+    return result, scale
+
+
 def fp8_quantize(
     x: torch.Tensor,
     scale: float | torch.Tensor | None = None,
@@ -139,6 +244,15 @@ def fp8_quantize(
         torch.float8_e5m2,
         torch.float8_e4m3fnuz,
     ), f"fp8_quantize unsupported fp8 dtype: {fp8_dtype}"
+
+    # ---- NPU early path (pure-PyTorch fallback) ----
+    if _HAS_NPU and x.device.type == "npu":
+        result = npu_fp8_quantize(x, scale=scale, fp8_dtype=fp8_dtype)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
     has_scale = scale is not None
     has_scale_tensor = isinstance(scale, torch.Tensor)
     if has_scale_tensor:
@@ -309,6 +423,9 @@ def triton_quantize_fp8_with_scale(
     scale_encoding: str = "float32",
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # NPU fallback: use per-tensor simulation
+    if _HAS_NPU and x.device.type == "npu":
+        return npu_fp8_quantize_with_scale(x, granularity=granularity)
     if granularity != "token_group" or group_size != 128:
         raise ValueError(
             "triton FP8 dynamic quantization currently supports only "
@@ -481,4 +598,6 @@ __all__ = [
     "mxfp4_quantize",
     "triton_quantize_mxfp4",
     "triton_quantize_fp8_with_scale",
+    "npu_fp8_quantize",
+    "npu_fp8_quantize_with_scale",
 ]

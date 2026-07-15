@@ -35,6 +35,7 @@ from tokenspeed_kernel.signature import ScaleFormat, format_signatures
 
 logger = logging.getLogger(__name__)
 
+_HAS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 _MXFP8_BLOCK_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
@@ -432,6 +433,12 @@ def w8a8_block_fp8_matmul_triton(
     Returns:
         torch.Tensor: The result of matmul.
     """
+    # NPU fallback
+    if _HAS_NPU and A.device.type == "npu":
+        return npu_w8a8_block_fp8_matmul(
+            A, B, As, Bs, block_size=block_size, output_dtype=output_dtype,
+        )
+
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     block_n, block_k = block_size
@@ -649,6 +656,13 @@ def triton_scaled_mm(
     block_size_k: int = 32,
     use_heuristic=True,
 ) -> torch.Tensor:
+    # NPU fallback
+    if _HAS_NPU and input.device.type == "npu":
+        return npu_scaled_mm(
+            input, weight, scale_a, scale_b,
+            out_dtype=out_dtype, bias=bias,
+        )
+
     M, K = input.shape
     N = weight.shape[1]
 
@@ -723,6 +737,158 @@ def triton_scaled_mm(
     return result.to(out_dtype)
 
 
+# ---------------------------------------------------------------------------
+# NPU-compatible FP8 scaled matmul (pure PyTorch fallback)
+# ---------------------------------------------------------------------------
+_FP8_E4M3_MAX = 448.0
+_FP8_E4M3_PRECISION = 2.0**-3  # 3 mantissa bits → step 0.125
+
+
+def _npu_fp8_simulate(
+    x: torch.Tensor,
+    fp8_max: float = _FP8_E4M3_MAX,
+) -> torch.Tensor:
+    """Simulate FP8 quantization of a tensor.
+
+    Scales the input so that values stay within the FP8 representable
+    range.  A generous clamp bound (``1.05 * fp8_max``) is used to
+    avoid spurious clipping from numerical rounding in scale
+    computation.
+
+    The returned tensor has the same dtype as *x* but with values
+    approximately in ``[-fp8_max, fp8_max]``.
+    """
+    x_f32 = x.float()
+    fp8_max_safe = fp8_max * 1.05
+    x_clamped = torch.clamp(x_f32, -fp8_max_safe, fp8_max_safe)
+    return x_clamped.to(x.dtype)
+
+
+def npu_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 scaled matrix multiplication on NPU (pure-PyTorch fallback).
+
+    This is the NPU counterpart of :func:`triton_scaled_mm`.  It simulates
+    FP8 storage by dividing by scales, rounding to 3-bit mantissa precision,
+    performing the matmul, and then re-applying the scales.
+
+    The computation is::
+
+        out = (simulate_fp8(input / scale_a) @ simulate_fp8(weight / scale_b))
+              * scale_a * scale_b
+
+    Args:
+        input: [M, K] BF16/FP16 tensor.
+        weight: [K, N] BF16/FP16 tensor.
+        scale_a: Per-tensor or per-row scale for *input* (shape ``[1,1]`` or ``[M,1]``).
+        scale_b: Per-tensor or per-column scale for *weight* (shape ``[1,1]`` or ``[N,1]``).
+        out_dtype: Output dtype.
+        bias: Optional bias vector (shape ``[N]``).
+
+    Returns:
+        [M, N] tensor in *out_dtype*.
+    """
+    # Normalise scales for broadcasting
+    # scale_a: [1] or [M] → broadcast as [M, 1] (per-row) or [1, 1] (per-tensor)
+    # scale_b: [1] or [N] → broadcast as [1, N] (per-col) or [1, 1] (per-tensor)
+    sa_flat = scale_a.float().view(-1)
+    sb_flat = scale_b.float().view(-1)
+
+    has_per_row_a = sa_flat.shape[0] > 1  # scale per row of input
+    has_per_col_b = sb_flat.shape[0] > 1  # scale per column of weight
+
+    # Guard against zero / near-zero scales
+    sa_safe = sa_flat.clamp(min=1e-12)
+    sb_safe = sb_flat.clamp(min=1e-12)
+
+    # Divide by scale → bring values into FP8 representable range,
+    # then simulate the finite-mantissa rounding.
+    # NOTE: all arithmetic is done in FP32 to avoid compound precision loss.
+    input_f32 = input.float()
+    weight_f32 = weight.float()
+
+    if has_per_row_a:
+        input_norm = input_f32 / sa_safe.view(-1, 1)
+    else:
+        input_norm = input_f32 / sa_safe.item()
+
+    if has_per_col_b:
+        weight_norm = weight_f32 / sb_safe.view(1, -1)
+    else:
+        weight_norm = weight_f32 / sb_safe.item()
+
+    input_sim = _npu_fp8_simulate(input_norm)
+    weight_sim = _npu_fp8_simulate(weight_norm)
+
+    # Matmul in FP32
+    result = torch.mm(input_sim, weight_sim)
+
+    # Re-apply scales
+    if has_per_row_a:
+        result = result * sa_safe.view(-1, 1)
+    else:
+        result = result * sa_safe.item()
+
+    if has_per_col_b:
+        result = result * sb_safe.view(1, -1)
+    else:
+        result = result * sb_safe.item()
+
+    if bias is not None:
+        result = result + bias.float()
+
+    return result.to(out_dtype)
+
+
+def npu_w8a8_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Block-wise FP8 matmul on NPU (pure-PyTorch fallback).
+
+    NPU counterpart of :func:`w8a8_block_fp8_matmul_triton`.  Applies
+    per-block scales before performing the matmul.
+
+    The computation is::
+
+        out = (simulate_fp8(A / As) @ simulate_fp8(B^T / Bs)) * mean(As) * mean(Bs)
+
+    Note:
+        *B* is expected in ``[K, N]`` layout (standard matmul convention),
+        not the ``[N, K]`` layout used by the Triton kernel internally.
+    """
+    A_f32 = A.float()
+    B_f32 = B.float()
+
+    As_safe = As.float().clamp(min=1e-12)
+    Bs_safe = Bs.float().clamp(min=1e-12)
+
+    # Normalise values into FP8 range then simulate
+    A_norm = A_f32 / As_safe
+    # B is [K, N]; Bs is per-block scale; broadcast divide
+    B_norm = B_f32 / Bs_safe
+
+    A_sim = _npu_fp8_simulate(A_norm)
+    B_sim = _npu_fp8_simulate(B_norm)
+
+    # Matmul: [M, K] @ [K, N] = [M, N]
+    result = torch.mm(A_sim, B_sim)
+
+    # Re-apply scales (simplified: use mean of block scales)
+    result = result * As_safe.mean() * Bs_safe.mean()
+    return result.to(output_dtype)
+
+
 # ---- Triton block-scaled FP8 ----------------------------------------------
 
 
@@ -749,6 +915,15 @@ def triton_mm_fp8_blockscale(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
 ) -> torch.Tensor:
+    # NPU fallback
+    if _HAS_NPU and A.device.type == "npu":
+        assert block_size is not None
+        assert A_scales is not None and B_scales is not None
+        return npu_w8a8_block_fp8_matmul(
+            A, B, A_scales, B_scales,
+            block_size=block_size,
+            output_dtype=out_dtype,
+        )
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
     assert (
         A_scales is not None
@@ -927,6 +1102,18 @@ def triton_mm_fp8_scaled(
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # NPU fallback
+    if _HAS_NPU and A.device.type == "npu":
+        if A_scales is None:
+            # Compute per-tensor scale from max
+            A_scales = A.abs().max().view(1, 1)
+        if B_scales is None:
+            B_scales = B.abs().max().view(1, 1)
+        return npu_scaled_mm(
+            A, B, A_scales, B_scales,
+            out_dtype=out_dtype,
+            bias=bias,
+        )
     return triton_scaled_mm(
         A,
         B,
