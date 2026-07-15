@@ -182,6 +182,35 @@ def _fused_qk_rmsnorm_kernel(
     tl.store(out_addrs, x * w, mask=mask)
 
 
+def _is_npu_available() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def _qk_rmsnorm_pytorch_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch fallback for qk_rmsnorm when Triton is unavailable (e.g. NPU)."""
+    head_dim = q_weight.shape[0]
+    num_q_heads = q.shape[-1] // head_dim
+    num_kv_heads = k.shape[-1] // head_dim
+    n_tokens = q.numel() // q.shape[-1]
+
+    # Reshape to [n_tokens, heads, head_dim] for per-head RMS norm
+    q_3d = q.reshape(n_tokens, num_q_heads, head_dim)
+    k_3d = k.reshape(n_tokens, num_kv_heads, head_dim)
+
+    # Per-head RMSNorm using F.rms_norm
+    import torch.nn.functional as F
+    q_out = F.rms_norm(q_3d, (head_dim,), weight=q_weight, eps=eps)
+    k_out = F.rms_norm(k_3d, (head_dim,), weight=k_weight, eps=eps)
+
+    return q_out.reshape(q.shape), k_out.reshape(k.shape)
+
+
 def qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -195,9 +224,16 @@ def qk_rmsnorm(
     and writes to fresh contiguous output tensors. The kernel uses the input
     leading-axis stride directly, so no ``.contiguous()`` copy is required
     on the inputs.
+
+    On NPU (Ascend), falls back to a pure PyTorch implementation.
     """
     if q.shape[0] == 0:
         return torch.empty_like(q), torch.empty_like(k)
+
+    # NPU fallback: use pure PyTorch when Triton driver is unavailable
+    if _is_npu_available():
+        return _qk_rmsnorm_pytorch_fallback(q, k, q_weight, k_weight, eps)
+
     head_dim = q_weight.shape[0]
     assert k_weight.shape[0] == head_dim, "q/k_weight must share head_dim"
     assert q.shape[-1] % head_dim == 0 and k.shape[-1] % head_dim == 0
