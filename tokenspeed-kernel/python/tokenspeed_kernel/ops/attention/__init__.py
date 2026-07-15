@@ -23,13 +23,20 @@ from __future__ import annotations
 import math
 
 # Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
-import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
-import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
-import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton  # noqa: F401
+# CUDA/Triton backends are imported only on supported platforms to avoid
+# crashes on NPU (Ascend) where triton is not available.
+import torch as _torch
+
+_is_npu = hasattr(_torch, "npu") and _torch.npu.is_available()
+
+if not _is_npu:
+    import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
+    import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
+    import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
+    import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
+    import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
+    import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
+    import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import tokenspeed_kernel.ops.attention.ascend  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (

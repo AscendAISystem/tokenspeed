@@ -20,9 +20,16 @@
 from typing import Any
 
 # Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
-import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton  # noqa: F401
+# CUDA/Triton backends are imported only on supported platforms to avoid
+# crashes on NPU (Ascend) where triton is not available.
+import torch as _torch
+
+_is_npu = hasattr(_torch, "npu") and _torch.npu.is_available()
+
+if not _is_npu:
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
+    import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
+    import tokenspeed_kernel.ops.moe.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel

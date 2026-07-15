@@ -45,6 +45,8 @@ def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:
         return TRTLLMMLABackend(config)
     if platform.is_amd:
         return MLAAttnBackend(config)
+    if platform.is_npu:
+        return MLAAttnBackend(config)
     raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 

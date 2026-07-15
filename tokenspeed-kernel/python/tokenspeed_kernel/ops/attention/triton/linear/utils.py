@@ -136,8 +136,15 @@ def get_available_device() -> str:
         _cpu_device_warning()
 
 
-device = get_available_device() if get_available_device() != "hip" else "cuda"
-device_torch_lib = getattr(torch, device)
+try:
+    _dev = get_available_device()
+    device = "cuda" if _dev == "hip" else _dev
+    device_torch_lib = getattr(torch, device)
+except RuntimeError:
+    # NPU or other unsupported platform — set to a safe fallback.
+    # Individual functions that need a real device must check at call time.
+    device = "cpu"
+    device_torch_lib = torch.cpu
 
 
 def get_all_max_shared_mem():

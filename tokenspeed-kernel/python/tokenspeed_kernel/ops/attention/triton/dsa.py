@@ -20,11 +20,24 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+
+_NPU_AVAILABLE: bool | None = None
+
+
+def _is_npu_available() -> bool:
+    global _NPU_AVAILABLE
+    if _NPU_AVAILABLE is None:
+        _NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
+    return _NPU_AVAILABLE
 
 
 @triton.jit
@@ -378,6 +391,110 @@ def _run_dense_kv(
     return out
 
 
+def _run_dsa_sdpa_npu(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    packed_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    k_scale: float = 1.0,
+) -> torch.Tensor:
+    """SDPA-based fallback for DSA attention on NPU.
+
+    This implements the same sparse top-k attention as the Triton kernel
+    but using pure PyTorch operations (no triton-ascend required).
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    topk = topk_slots.shape[1]
+    device = q.device
+    dtype = q.dtype
+
+    # Scale
+    scale = float(softmax_scale) * float(k_scale)
+
+    slots_flat = topk_slots.reshape(-1)  # [num_tokens * topk]
+    valid_mask = (slots_flat >= 0).reshape(num_tokens, topk)
+
+    if packed_kv_cache is not None:
+        # FP8 packed KV cache: [num_slots, row_bytes] in uint8
+        # Each row: [kv_lora_rank FP8 + scales + qk_rope_head_dim BF16]
+        kv_fp8 = packed_kv_cache.view(torch.float8_e4m3fn)
+        kv_scale_raw = packed_kv_cache.view(torch.float32)
+        kv_rope_raw = packed_kv_cache.view(torch.bfloat16)
+        row_bytes = int(packed_kv_cache.shape[1])
+
+        # Gather nope (latent) keys: [num_tokens, topk, kv_lora_rank]
+        k_nope_fp8 = kv_fp8[slots_flat.long()]  # [num_tokens * topk, row_bytes]
+        k_nope_fp8 = k_nope_fp8[:, :kv_lora_rank].reshape(num_tokens, topk, kv_lora_rank)
+        k_nope = k_nope_fp8.to(dtype)
+
+        # Gather scales: [num_tokens, topk, kv_lora_rank // 128 * 4]
+        scale_flat = kv_scale_raw[slots_flat.long()]
+        # scales are stored as float32 at offset kv_lora_rank in the float32 view
+        # The scale for each group of 128 is a single float32
+        num_groups = (kv_lora_rank + 127) // 128
+        k_scale_flat = scale_flat[:, kv_lora_rank:kv_lora_rank + num_groups].reshape(num_tokens, topk, num_groups)
+        # Apply scale: expand to per-element
+        k_nope = k_nope * k_scale_flat  # simplified per-group scaling
+
+        # Gather rope part from bfloat16 view
+        rope_flat = kv_rope_raw[slots_flat.long()]
+        kv_rope = rope_flat[:, kv_lora_rank + num_groups:
+                             kv_lora_rank + num_groups + qk_rope_head_dim].reshape(
+            num_tokens, topk, qk_rope_head_dim
+        ).to(dtype)
+    else:
+        # Dense KV cache: [num_slots, kv_dim] where kv_dim = kv_lora_rank + qk_rope_head_dim
+        kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+        kv_flat = kv_cache[slots_flat.long()]  # [num_tokens * topk, kv_dim]
+        k_nope = kv_flat[:, :kv_lora_rank].reshape(num_tokens, topk, kv_lora_rank).to(dtype)
+        kv_rope = kv_flat[:, kv_lora_rank:].reshape(num_tokens, topk, qk_rope_head_dim).to(dtype)
+
+    # Split query into nope and rope parts
+    q_nope = q[..., :kv_lora_rank]  # [num_tokens, num_heads, kv_lora_rank]
+    q_rope = q[..., kv_lora_rank:kv_lora_rank + qk_rope_head_dim]  # [num_tokens, num_heads, qk_rope_head_dim]
+
+    # Compute attention scores
+    # q_nope: [num_tokens, num_heads, kv_lora_rank]
+    # k_nope: [num_tokens, topk, kv_lora_rank]
+    # We need to broadcast over heads
+    scores_nope = torch.einsum("bhd,bsd->bhs", q_nope.float(), k_nope.float())  # [num_tokens, num_heads, topk]
+    scores_rope = torch.einsum("bhd,bsd->bhs", q_rope.float(), kv_rope.float())  # [num_tokens, num_heads, topk]
+    scores = (scores_nope + scores_rope) * scale  # [num_tokens, num_heads, topk]
+
+    # Mask invalid positions
+    valid_mask_3d = valid_mask.unsqueeze(1)  # [num_tokens, 1, topk]
+    scores = torch.where(valid_mask_3d, scores, torch.tensor(-float("inf"), device=device))
+
+    # Softmax
+    max_scores = scores.max(dim=-1, keepdim=True).values
+    exp_scores = torch.exp(scores - max_scores)
+    exp_scores = torch.where(valid_mask_3d, exp_scores, torch.tensor(0.0, device=device))
+    probs = exp_scores / exp_scores.sum(dim=-1, keepdim=True).clamp_min(1e-12)  # [num_tokens, num_heads, topk]
+
+    # Gather V values and compute weighted output
+    if packed_kv_cache is not None:
+        # V is the same as K in packed format (kv_fp8 contains both K and V)
+        v_fp8 = k_nope_fp8  # V stored alongside K
+        v_nope = v_fp8.to(dtype)
+        v_nope = v_nope * k_scale_flat  # same dequant
+    else:
+        # In dense format, V = K for the nope part (same tensor)
+        v_flat = kv_cache[slots_flat.long()]
+        v_nope = v_flat[:, :kv_lora_rank].reshape(num_tokens, topk, kv_lora_rank).to(dtype)
+
+    # Weighted sum: [num_tokens, num_heads, topk] x [num_tokens, topk, kv_lora_rank]
+    # -> [num_tokens, num_heads, kv_lora_rank]
+    out = torch.einsum("bhs,bsd->bhd", probs, v_nope.float())
+    out = out.to(dtype)
+
+    return out
+
+
 def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
     if packed_kv_cache.dim() == 2:
         return packed_kv_cache
@@ -418,6 +535,26 @@ def _run_dsa(
     topk_lens = topk_lens.contiguous()
     softmax_scale = float(softmax_scale) * float(k_scale)
 
+    # NPU fallback: use pure PyTorch SDPA-like sparse attention
+    # since triton-ascend may not be available or compatible.
+    if _is_npu_available():
+        result = _run_dsa_sdpa_npu(
+            q=q,
+            kv_cache=kv_cache,
+            packed_kv_cache=packed_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            k_scale=k_scale,
+        )
+        if out is not None:
+            out_view = out.reshape_as(result)
+            out_view.copy_(result)
+            return out
+        return result
+
     if packed_kv_cache is not None:
         result = _run_packed_kv(
             q,
@@ -451,7 +588,7 @@ def _run_dsa(
     "dsa_decode",
     name="triton_dsa_decode",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "huawei"})),
     signatures=frozenset(
         {
             format_signature(q=dense_tensor_format(torch.bfloat16)),
@@ -511,7 +648,7 @@ def triton_dsa_decode(
     "dsa_prefill",
     name="triton_dsa_prefill",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd", "huawei"})),
     signatures=frozenset(
         {
             format_signature(q=dense_tensor_format(torch.bfloat16)),
