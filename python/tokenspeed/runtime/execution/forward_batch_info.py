@@ -25,8 +25,13 @@ from __future__ import annotations
 from enum import IntEnum, auto
 
 import torch
-import triton
-import triton.language as tl
+
+from tokenspeed.runtime.utils.device_utils import is_npu_available
+
+_USE_TRITON = not is_npu_available()
+if _USE_TRITON:
+    import triton
+    import triton.language as tl
 
 
 class ForwardMode(IntEnum):
@@ -91,6 +96,62 @@ def compute_position_triton(
     extend_seq_lens_sum,
     out: torch.Tensor | None = None,
 ):
+    if _USE_TRITON:
+        return _compute_position_triton_kernel(
+            extend_prefix_lens, extend_seq_lens, extend_seq_lens_sum, out
+        )
+    return _compute_position_torch(
+        extend_prefix_lens, extend_seq_lens, extend_seq_lens_sum, out
+    )
+
+
+def _compute_position_torch(
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    out: torch.Tensor | None = None,
+):
+    batch_size = extend_seq_lens.shape[0]
+    device = extend_seq_lens.device
+    if out is None:
+        positions = torch.empty(
+            extend_seq_lens_sum, dtype=torch.int64, device=device
+        )
+    else:
+        if out.numel() < extend_seq_lens_sum:
+            raise ValueError(
+                "compute_position out buffer too small: "
+                f"{out.numel()} < {extend_seq_lens_sum}"
+            )
+        positions = out
+
+    # Cumulative sum of sequence lengths to get start offsets
+    extend_start_loc = torch.zeros(
+        batch_size, dtype=torch.int32, device=device
+    )
+    if batch_size > 1:
+        torch.cumsum(extend_seq_lens[:-1], dim=0, out=extend_start_loc[1:])
+
+    has_prefix = extend_prefix_lens.shape[0] == batch_size
+
+    # Fill positions for each sequence using vectorized ops
+    for pid in range(batch_size):
+        prefix_len = extend_prefix_lens[pid] if has_prefix else 0
+        seq_len = extend_seq_lens[pid].item()
+        start = extend_start_loc[pid].item()
+        positions[start : start + seq_len] = torch.arange(
+            prefix_len, prefix_len + seq_len, device=device
+        )
+
+    return positions, extend_start_loc
+
+
+def _compute_position_triton_kernel(
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    out: torch.Tensor | None = None,
+):
     batch_size = extend_seq_lens.shape[0]
     if out is None:
         positions = torch.empty(
@@ -115,31 +176,33 @@ def compute_position_triton(
     return positions, extend_start_loc
 
 
-@triton.jit
-def compute_position_kernel(
-    positions,
-    extend_start_loc,
-    extend_prefix_lens,
-    extend_seq_lens,
-    has_prefix: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(0).to(tl.int64)
+if _USE_TRITON:
 
-    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
-    seq_len = tl.load(extend_seq_lens + pid)
+    @triton.jit
+    def compute_position_kernel(
+        positions,
+        extend_start_loc,
+        extend_prefix_lens,
+        extend_seq_lens,
+        has_prefix: tl.constexpr,
+    ):
+        BLOCK_SIZE: tl.constexpr = 512
+        pid = tl.program_id(0).to(tl.int64)
 
-    #  This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
+        prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
+        seq_len = tl.load(extend_seq_lens + pid)
 
-    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        tl.store(
-            positions + cumsum_start + offset,
-            prefix_len + offset,
-            mask=offset < seq_len,
-        )
-    tl.store(extend_start_loc + pid, cumsum_start)
+        #  This can be slow for large bs
+        cumsum_start = tl.cast(0, tl.int64)
+        for i in range(pid):
+            cumsum_start += tl.load(extend_seq_lens + i)
+
+        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+            tl.store(
+                positions + cumsum_start + offset,
+                prefix_len + offset,
+                mask=offset < seq_len,
+            )
+        tl.store(extend_start_loc + pid, cumsum_start)
