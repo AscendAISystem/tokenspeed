@@ -119,12 +119,12 @@ def npu_embedding_rope(
     num_kv_heads = k.shape[-1] // head_size
 
     # Reshape to [num_tokens, num_heads, head_size]
-    q_3d = q.view(num_tokens, -1, head_size)
-    k_3d = k.view(num_tokens, -1, head_size)
+    q_3d = q.reshape(num_tokens, -1, head_size)
+    k_3d = k.reshape(num_tokens, -1, head_size)
 
     # Determine output views
-    q_out_3d = q_rope_out.view(num_tokens, num_q_heads, head_size) if q_rope_out is not None else q_3d
-    k_out_3d = k_rope_out.view(num_tokens, num_kv_heads, head_size) if k_rope_out is not None else k_3d
+    q_out_3d = q_rope_out.reshape(num_tokens, num_q_heads, head_size) if q_rope_out is not None else q_3d
+    k_out_3d = k_rope_out.reshape(num_tokens, num_kv_heads, head_size) if k_rope_out is not None else k_3d
 
     rotary_emb = _get_npu_rotary_embedding()
     if rotary_emb is not None:
