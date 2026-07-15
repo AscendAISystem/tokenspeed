@@ -23,6 +23,10 @@ import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
+    compute_paged_cache_group_page_counts,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
@@ -57,6 +61,27 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
+        )
+
+        # Initialize paged cache group specs (required by C++ Scheduler)
+        self.paged_cache_group_specs = (
+            PagedCacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                rows_per_page=1,
+                entry_stride_tokens=self.page_size,
+                sliding_window_tokens=None,
+                family="history",
+            ),
+        )
+        self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
+            self.paged_cache_group_specs,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=0,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
+            decode_input_tokens=1,
+            overlap_schedule_depth=0,
         )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
