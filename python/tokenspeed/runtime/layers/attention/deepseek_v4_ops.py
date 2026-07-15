@@ -299,9 +299,9 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
         weights = weights.squeeze(-1)
     if weights.shape != index_q.shape[:2]:
         raise ValueError(f"weights must be [tokens, heads], got {tuple(weights.shape)}")
-    if not index_q.is_cuda:
+    if not (index_q.is_cuda or index_q.is_npu):
         raise ValueError(
-            "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
+            "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA/NPU tensors."
         )
     return _triton_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,
@@ -389,7 +389,7 @@ def _write_fp8_ds_mla_cache_rows_capturable(
     scale_dim = deepseek_v4_swa_scale_dim(head_dim, rope_dim)
     slots = kv_slot_mapping[:num_rows].to(torch.int64)
     valid = valid[:num_rows] & (slots >= 0)
-    if not (slots.is_cuda and torch.npu.is_current_stream_capturing()):
+    if not ((slots.is_cuda or slots.is_npu) and torch.npu.is_current_stream_capturing()):
         if not bool(valid.any()):
             return
         normed = normed[:num_rows][valid]
@@ -487,9 +487,9 @@ def save_deepseek_v4_compressor_state(
     num_actual = min(slot_mapping.numel(), kv.shape[0])
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or state_cache.is_npu):
         raise ValueError(
-            "save_deepseek_v4_compressor_state only supports CUDA tensors."
+            "save_deepseek_v4_compressor_state only supports CUDA/NPU tensors."
         )
 
     _triton_save_compressor_state(
@@ -567,9 +567,9 @@ def write_deepseek_v4_indexer_mxfp4_cache(
     num_actual = min(slot_mapping.numel(), index_k.shape[0])
     if num_actual == 0:
         return
-    if not index_k.is_cuda:
+    if not (index_k.is_cuda or index_k.is_npu):
         raise ValueError(
-            "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA tensors."
+            "write_deepseek_v4_indexer_mxfp4_cache only supports CUDA/NPU tensors."
         )
     valid = torch.ones(num_actual, device=index_k.device, dtype=torch.bool)
     _triton_write_indexer_mxfp4_cache_cuda(
@@ -609,7 +609,7 @@ def _write_deepseek_v4_indexer_fp8_cache_capturable(
 
     slots = slot_mapping[:num_rows].to(torch.int64)
     valid = valid[:num_rows] & (slots >= 0)
-    if not (slots.is_cuda and torch.npu.is_current_stream_capturing()):
+    if not ((slots.is_cuda or slots.is_npu) and torch.npu.is_current_stream_capturing()):
         if not bool(valid.any()):
             return
         rows = rows[valid]
@@ -886,9 +886,9 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     )
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or state_cache.is_npu):
         raise ValueError(
-            "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
+            "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA/NPU tensors."
         )
 
     _triton_fused_sparse_compress_cache_insert(
@@ -964,9 +964,9 @@ def deepseek_v4_csa_compress_kv_cache_insert(
     num_actual = min(compressor_slot_mapping.numel(), positions.numel())
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or state_cache.is_npu):
         raise ValueError(
-            "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA tensors."
+            "deepseek_v4_csa_compress_kv_cache_insert only supports CUDA/NPU tensors."
         )
 
     _triton_fused_sparse_compress_cache_insert(
@@ -1024,9 +1024,9 @@ def deepseek_v4_csa_indexer_cache_insert(
     num_actual = min(compressor_slot_mapping.numel(), positions.numel())
     if num_actual == 0:
         return
-    if not state_cache.is_cuda:
+    if not (state_cache.is_cuda or state_cache.is_npu):
         raise ValueError(
-            "deepseek_v4_csa_indexer_cache_insert only supports CUDA tensors."
+            "deepseek_v4_csa_indexer_cache_insert only supports CUDA/NPU tensors."
         )
     if use_fp4_cache:
         _triton_fused_csa_indexer_mxfp4_cache_insert(

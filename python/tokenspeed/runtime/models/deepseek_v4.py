@@ -238,7 +238,7 @@ def _deepseek_v4_router_gemm(
     if (
         hidden_states.dim() == 2
         and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
+        and (hidden_states.is_cuda or hidden_states.is_npu)
         and hidden_states.dtype == torch.bfloat16
         and weight.dtype in (torch.bfloat16, torch.float32)
         and (_platform.is_hopper or _platform.is_blackwell)
@@ -265,9 +265,9 @@ def _deepseek_v4_bf16_linear_fp32(
     if (
         hidden_states.dim() == 2
         and hidden_states.shape[0] > 0
-        and hidden_states.is_cuda
+        and (hidden_states.is_cuda or hidden_states.is_npu)
         and hidden_states.dtype == torch.bfloat16
-        and weight.is_cuda
+        and (weight.is_cuda or weight.is_npu)
         and weight.dtype == torch.bfloat16
         and weight.dim() == 2
         and hidden_states.shape[1] == weight.shape[1]
@@ -292,7 +292,7 @@ def _deepseek_v4_fused_select_experts(
     input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if (
-        not router_logits.is_cuda
+        not current_platform().is_nvidia
         or router_logits.dim() != 2
         or top_k <= 0
         or top_k > 32
@@ -524,7 +524,7 @@ def pack_topk_as_router_logits(
 def _deepseek_v4_deepgemm_fp4_indexer_available(index_q: torch.Tensor) -> bool:
     return (
         deep_gemm is not None
-        and index_q.is_cuda
+        and current_platform().is_nvidia
         and index_q.dim() >= 3
         and index_q.shape[-2] in (32, 64)
         and (index_q.shape[-1] * 2) % DEEPSEEK_V4_MXFP4_BLOCK_SIZE == 0
@@ -577,10 +577,9 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     if total_rows == 0:
         return values.view(torch.int8), scales.view(torch.int32).squeeze(-1)
 
-    if not (cache_2d.is_cuda and block_table.is_cuda and cu_seq_lens.is_cuda):
+    if not current_platform().is_nvidia:
         raise RuntimeError(
-            "DeepSeek V4 paged MXFP4 gather requires cache, block table, "
-            "and sequence lengths on CUDA"
+            "DeepSeek V4 paged MXFP4 gather requires NVIDIA CUDA"
         )
     if not has_indexer_mxfp4_paged_gather():
         raise RuntimeError(
@@ -609,22 +608,20 @@ def _deepseek_v4_indexer_topk_from_logits(
     out: torch.Tensor | None = None,
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if not logits.is_cuda or logits.dtype != torch.float32:
-        raise RuntimeError("DeepSeek V4 indexer top-k requires CUDA float32 logits")
-    if not lengths.is_cuda or lengths.device != logits.device:
+    if not current_platform().is_nvidia:
+        raise RuntimeError("DeepSeek V4 indexer top-k requires NVIDIA CUDA")
+    if logits.dtype != torch.float32:
+        raise RuntimeError("DeepSeek V4 indexer top-k requires float32 logits")
+    if lengths.device != logits.device:
         raise RuntimeError(
-            "DeepSeek V4 indexer top-k requires CUDA length tensors "
+            "DeepSeek V4 indexer top-k requires length tensors "
             "on the logits device"
         )
-    if row_starts is not None and (
-        not row_starts.is_cuda or row_starts.device != logits.device
-    ):
+    if row_starts is not None and row_starts.device != logits.device:
         raise RuntimeError(
             "DeepSeek V4 indexer top-k requires row_starts on the logits device"
         )
-    if row_ends is not None and (
-        not row_ends.is_cuda or row_ends.device != logits.device
-    ):
+    if row_ends is not None and row_ends.device != logits.device:
         raise RuntimeError(
             "DeepSeek V4 indexer top-k requires row_ends on the logits device"
         )
@@ -682,7 +679,7 @@ def _deepseek_v4_indexer_topk_from_logits(
 
     if (
         persistent_topk_workspace is not None
-        and persistent_topk_workspace.is_cuda
+        and current_platform().is_nvidia
         and persistent_topk_workspace.device == logits.device
         and persistent_topk_workspace.numel() >= 1024 * 1024
         and persistent_topk_workspace.dtype == torch.uint8
@@ -723,8 +720,10 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
 ) -> torch.Tensor:
     """Use the local TRT-LLM CUDA prefill selector."""
 
-    if not logits.is_cuda or logits.dtype != torch.float32:
-        raise RuntimeError("DeepSeek V4 prefill indexer requires CUDA float32 logits")
+    if not current_platform().is_nvidia:
+        raise RuntimeError("DeepSeek V4 prefill indexer requires NVIDIA CUDA")
+    if logits.dtype != torch.float32:
+        raise RuntimeError("DeepSeek V4 prefill indexer requires float32 logits")
     trtllm_ops = getattr(torch.ops, "trtllm", None)
     if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
         raise RuntimeError(
@@ -1891,8 +1890,8 @@ def _deepseek_v4_sparse_attn_indexer(
             dtype=indexer_block_table.dtype,
             device=indexer_block_table.device,
         )
-    if not positions.is_cuda:
-        raise RuntimeError("DeepSeek V4 sparse indexer requires CUDA tensors")
+    if not current_platform().is_nvidia:
+        raise RuntimeError("DeepSeek V4 sparse indexer requires NVIDIA CUDA")
     return torch.ops.tokenspeed.deepseek_v4_sparse_attn_indexer(
         indexer_cache,
         positions,
@@ -2287,6 +2286,11 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return sf.float()
 
     def _check_runtime_supported(self) -> None:
+        # NPU environment: skip CUDA-specific checks
+        from tokenspeed.runtime.utils.device_utils import is_npu_available
+
+        if is_npu_available():
+            return
         if not torch.npu.is_available():
             raise NotImplementedError("DeepSeek V4 MegaMoE requires CUDA.")
         device = self.w13_weight.device
@@ -2987,7 +2991,7 @@ class DeepseekV4Indexer(nn.Module):
         ctx: ForwardContext,
         indexer_block_size: int,
     ) -> None:
-        if not self.use_fp4_cache or not positions.is_cuda:
+        if not self.use_fp4_cache or not (positions.is_cuda or positions.is_npu):
             return
         forward_mode = ctx.forward_mode
         if forward_mode is not None and forward_mode.is_mixed():
@@ -3054,8 +3058,8 @@ class DeepseekV4Indexer(nn.Module):
             raise RuntimeError(
                 "DeepSeek V4 sparse indexer requires MXFP4 indexer cache"
             )
-        if not positions.is_cuda:
-            raise RuntimeError("DeepSeek V4 sparse indexer requires CUDA tensors")
+        if not current_platform().is_nvidia:
+            raise RuntimeError("DeepSeek V4 sparse indexer requires NVIDIA CUDA")
 
         forward_mode = ctx.forward_mode
         total_tokens = positions.numel()
@@ -3467,7 +3471,7 @@ class DeepseekV4Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        if self.use_fused_qkv_rmsnorm and qr.is_cuda and qr.shape[0] > 0:
+        if self.use_fused_qkv_rmsnorm and current_platform().is_nvidia and qr.shape[0] > 0:
             qr_norm = torch.empty(
                 qr.shape,
                 dtype=qr.dtype,
@@ -4207,6 +4211,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def _warmup_mega_moe_jit(self) -> None:
         if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
             return
+        from tokenspeed.runtime.utils.device_utils import is_npu_available
+
+        device_type = "npu" if is_npu_available() else "cuda"
         for module in self.modules():
             if not isinstance(module, DeepseekV4MegaMoEExperts):
                 continue
@@ -4224,7 +4231,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 max_num_tokens=module.max_num_tokens,
                 top_k=module.top_k,
                 hidden_size=module.hidden_size,
-                device=torch.device("cuda", torch.npu.current_device()),
+                device=torch.device(device_type, torch.npu.current_device()),
                 transformed_l1_weights=module._transformed_l1_weights,
                 transformed_l2_weights=module._transformed_l2_weights,
                 symm_buffer=module.get_symm_buffer(),
@@ -4237,6 +4244,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             return
         if torch.npu.get_device_capability()[0] < 10:
             return
+        from tokenspeed.runtime.utils.device_utils import is_npu_available
+
+        device_type = "npu" if is_npu_available() else "cuda"
         config = self.config
         tp_size = self.mapping.attn.tp_size if self.mapping else 1
         logger.info("Pre-compiling DeepGEMM prefill kernel variants...")
@@ -4270,7 +4280,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             # (continuous batching), the same ceiling mega_moe warms to. Hardcoding
             # 8192 would leave M in (8192, chunked_prefill_size] to JIT inline.
             max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
-            device=torch.device("cuda", torch.npu.current_device()),
+            device=torch.device(device_type, torch.npu.current_device()),
         )
 
     def post_quant_warmup(self) -> None:

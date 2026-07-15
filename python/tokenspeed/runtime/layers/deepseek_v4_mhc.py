@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from tokenspeed.runtime.utils import ceil_div
+from tokenspeed_kernel.platform import current_platform
 
 try:
     from tokenspeed_kernel.thirdparty import deep_gemm
@@ -345,8 +346,8 @@ def mhc_pre(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
-    if not residual.is_cuda:
-        raise RuntimeError("fast mHC requires CUDA tensors")
+    if not current_platform().is_nvidia:
+        raise RuntimeError("fast mHC requires NVIDIA CUDA")
 
     if deep_gemm is None:
         raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
@@ -455,8 +456,8 @@ def mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    if not hidden_states.is_cuda:
-        raise RuntimeError("fast mHC requires CUDA tensors")
+    if not current_platform().is_nvidia:
+        raise RuntimeError("fast mHC requires NVIDIA CUDA")
     if residual.numel() == 0:
         return torch.empty_like(residual)
     out = torch.empty_like(residual)

@@ -823,7 +823,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             if metadata.is_valid_token is not None
             else None
         )
-        capturing = positions.is_cuda and torch.npu.is_current_stream_capturing()
+        capturing = (positions.is_cuda or positions.is_npu) and torch.npu.is_current_stream_capturing()
         if compress_ratio == 4:
             if topk_indices is None:
                 raise RuntimeError("DeepSeek V4 CSA decode requires top-k indices")

@@ -660,8 +660,8 @@ class DeepseekV4CacheMetadata:
         block_table = self.compressed_block_table(compress_ratio, kv_cache_block_size)
         if (
             use_decode_cache
-            and positions.is_cuda
-            and (block_table.is_cuda or self.block_table.is_cuda)
+            and (positions.is_cuda or positions.is_npu)
+            and ((block_table.is_cuda or block_table.is_npu) or (self.block_table.is_cuda or self.block_table.is_npu))
         ):
             cached = self.decode_compressed_slot_mappings.get(
                 (compress_ratio, kv_cache_block_size)
