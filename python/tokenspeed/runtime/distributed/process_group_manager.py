@@ -114,6 +114,10 @@ class ProcessGroupManager:
                 pg = dist.new_group(g, backend=backend)
                 if g == group:
                     self.register_process_group(backend, g, pg)
+                    # On NPU (backend="hccl"), also register under "nccl" alias
+                    # so that code querying with hardcoded "nccl" still works.
+                    if backend == "hccl":
+                        self.register_process_group("nccl", g, pg)
 
 
 process_group_manager = ProcessGroupManager()
