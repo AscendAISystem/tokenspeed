@@ -26,7 +26,9 @@ import torch as _torch
 
 _is_npu = hasattr(_torch, "npu") and _torch.npu.is_available()
 
-if not _is_npu:
+if _is_npu:
+    import tokenspeed_kernel.ops.moe.ascend  # noqa: F401
+else:
     import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
     import tokenspeed_kernel.ops.moe.triton  # noqa: F401
