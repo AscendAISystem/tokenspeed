@@ -235,9 +235,11 @@ def _expert_compute(
         Output tensor ``[n_tokens, hidden_size]``.
     """
     # Determine weight dimensions
-    is_expert_parallel = w13_weight.dim() == 3  # [E, K, inter]
-    inter_size = w13_weight.shape[-1]
-    half_inter = inter_size // 2
+    is_expert_parallel = w13_weight.dim() == 3  # [E, 2*intermediate, hidden] for w13
+    # w13_weight shape: [num_experts, 2 * intermediate_size, hidden_size]
+    # w2_weight shape:  [num_experts, hidden_size, intermediate_size]
+    total_inter = w13_weight.shape[1] if is_expert_parallel else w13_weight.shape[0]
+    half_inter = total_inter // 2
 
     output_buffer = torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
 
@@ -250,23 +252,24 @@ def _expert_compute(
         expert_tokens = dispatched_hidden[start:end]  # [N, hidden_size]
 
         if is_expert_parallel:
-            gate_w = w13_weight[expert_id, :, :half_inter]  # [K, H]
-            up_w = w13_weight[expert_id, :, half_inter:]    # [K, H]
-            down_w = w2_weight[expert_id] if w2_weight.dim() == 3 else w2_weight  # [H, K_out]
+            # w13_weight[expert_id]: [2*intermediate, hidden]
+            gate_w = w13_weight[expert_id, :half_inter, :]  # [intermediate, hidden]
+            up_w = w13_weight[expert_id, half_inter:, :]    # [intermediate, hidden]
+            down_w = w2_weight[expert_id] if w2_weight.dim() == 3 else w2_weight  # [hidden, intermediate]
         else:
-            gate_w = w13_weight[:, :half_inter]  # [K, H]
-            up_w = w13_weight[:, half_inter:]    # [K, H]
-            down_w = w2_weight                   # [H, K_out]
+            gate_w = w13_weight[:half_inter, :]  # [intermediate, hidden]
+            up_w = w13_weight[half_inter:, :]    # [intermediate, hidden]
+            down_w = w2_weight                   # [hidden, intermediate]
 
         # Step 1-2: Gate and Up projections
-        gate_out = torch.matmul(expert_tokens, gate_w.T)  # [N, H]
-        up_out = torch.matmul(expert_tokens, up_w.T)      # [N, H]
+        gate_out = torch.matmul(expert_tokens, gate_w.T)  # [N, hidden] @ [hidden, intermediate] -> [N, intermediate]
+        up_out = torch.matmul(expert_tokens, up_w.T)      # [N, hidden] @ [hidden, intermediate] -> [N, intermediate]
 
         # Step 3: SwiGLU activation
-        act_out = _npu_swiglu(gate_out, up_out)           # [N, H]
+        act_out = _npu_swiglu(gate_out, up_out)           # [N, intermediate]
 
         # Step 4: Down projection
-        expert_out = torch.matmul(act_out, down_w.T)      # [N, K_out]
+        expert_out = torch.matmul(act_out, down_w.T)      # [N, intermediate] @ [intermediate, hidden] -> [N, hidden]
 
         # Scale by routing weight and scatter back
         weight_scalar = sorted_weights[start:end].unsqueeze(-1)
