@@ -119,7 +119,8 @@ class PyNcclCommunicator:
         else:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
         if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
+            prefix = "npu" if torch.npu.is_available() else "cuda"
+            device = torch.device(f"{prefix}:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
         # now `device` is a `torch.device` object

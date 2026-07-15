@@ -312,7 +312,7 @@ def _block_tables_from_forward_op(
             -1,
             dtype=torch.int32,
             device="cpu",
-            pin_memory=device.type == "cuda",
+            pin_memory=device.type in ("cuda", "npu"),
         )
         for row_idx, row in enumerate(rows):
             row_len = len(row)
@@ -368,7 +368,7 @@ def paged_cache_block_table_base_offsets_from_forward_op(
             continue
         max_per_group[key] = int(max(rows))
         cpu = torch.tensor(rows, dtype=torch.int32, device="cpu")
-        if device.type == "cuda":
+        if device.type in ("cuda", "npu"):
             out[key] = cpu.pin_memory().to(device, non_blocking=True)
         else:
             out[key] = cpu.to(device)

@@ -208,6 +208,7 @@ def generate_attn_arg_prefill(
     kv_indices_buf: torch.Tensor | None = None,
     draft_decode_step: int | None = None,
 ):
+    device = req_pool_indices.device
     batch_size = req_pool_indices.shape[0]
     if draft_decode_step is not None:
         qo_indptr = torch.arange(
@@ -215,7 +216,7 @@ def generate_attn_arg_prefill(
             (1 + batch_size),
             step=1,
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
     else:
         qo_indptr = torch.arange(
@@ -223,10 +224,10 @@ def generate_attn_arg_prefill(
             (1 + batch_size) * draft_token_num,
             step=draft_token_num,
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
 
-    cum_kv_seq_len = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
+    cum_kv_seq_len = torch.zeros((batch_size + 1,), dtype=torch.int32, device=device)
 
     if draft_decode_step is None:
         paged_kernel_lens = paged_kernel_lens + draft_token_num
@@ -239,7 +240,7 @@ def generate_attn_arg_prefill(
     else:
         # Prevent kv_indices out of bounds in large steps
         kv_indices = torch.empty(
-            cum_kv_seq_len[-1] + 256, dtype=torch.int32, device="cuda"
+            cum_kv_seq_len[-1] + 256, dtype=torch.int32, device=device
         )
     create_flashinfer_kv_indices_triton[(batch_size,)](
         req_to_token,

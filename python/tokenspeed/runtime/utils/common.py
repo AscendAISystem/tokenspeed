@@ -260,7 +260,7 @@ def _load_image(
             from torchvision.io import decode_jpeg
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(encoded_image, device="npu" if torch.npu.is_available() else "cuda")
             return image_tensor
         except Exception as exc:
             logger.warning(

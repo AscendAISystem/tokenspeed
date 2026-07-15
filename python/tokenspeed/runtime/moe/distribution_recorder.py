@@ -36,6 +36,7 @@ import torch.distributed
 
 from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 from tokenspeed.runtime.utils import Withable
+from tokenspeed.runtime.utils.device_utils import get_current_device
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -404,7 +405,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=get_current_device() if torch.npu.is_available() else "cuda",
         )
 
     def reset(self):

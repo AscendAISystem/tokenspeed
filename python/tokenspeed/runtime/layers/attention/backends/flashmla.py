@@ -341,7 +341,7 @@ class FlashMLABackend(AttentionBackend):
             (max_bs, (max_context_len + 4 * PAGE_SIZE) // PAGE_SIZE),
             1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
         if self.draft_token_num:

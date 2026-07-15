@@ -377,7 +377,7 @@ class VisionEmbedder:
             )
             encoder_started = time.perf_counter() if LOG_MM_TIMING else None
             output = spec.fn(items)
-            if LOG_MM_TIMING and device.type == "cuda":
+            if LOG_MM_TIMING and device.type in ("cuda", "npu"):
                 torch.npu.synchronize(device)
             encoder_elapsed_ms = (
                 (time.perf_counter() - encoder_started) * 1000
