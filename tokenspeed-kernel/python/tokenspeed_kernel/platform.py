@@ -215,6 +215,10 @@ class PlatformInfo:
         """Register host memory that GPU kernels will directly dereference."""
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return
+        if self.is_huawei:
+            # Huawei Ascend NPU does not require cudaHostRegister;
+            # host memory is accessible via different mechanisms.
+            return
         status = torch.npu.cudart().cudaHostRegister(
             tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
         )
