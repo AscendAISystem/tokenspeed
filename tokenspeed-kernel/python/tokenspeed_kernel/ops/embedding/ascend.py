@@ -157,16 +157,18 @@ def npu_embedding_rope(
 
         cache_loc = fused_set_kv_buffer_arg.cache_loc
         value = fused_set_kv_buffer_arg.value  # V tensor
-        # Write rotated K into KV cache
+        # Write rotated K into KV cache (cast to KV cache dtype if needed)
         k_buffer_view = fused_set_kv_buffer_arg.k_buffer.view(
             fused_set_kv_buffer_arg.k_buffer.shape[0], num_kv_heads, head_size
         )
-        k_buffer_view[cache_loc] = k_out_3d
-        # Write V into KV cache
+        k_out_for_cache = k_out_3d.to(k_buffer_view.dtype)
+        k_buffer_view[cache_loc] = k_out_for_cache
+        # Write V into KV cache (cast to KV cache dtype if needed)
         v_buffer_view = fused_set_kv_buffer_arg.v_buffer.view(
             fused_set_kv_buffer_arg.v_buffer.shape[0], num_kv_heads, head_size
         )
-        v_buffer_view[cache_loc] = value.view(num_tokens, num_kv_heads, head_size)
+        v_for_cache = value.view(num_tokens, num_kv_heads, head_size).to(v_buffer_view.dtype)
+        v_buffer_view[cache_loc] = v_for_cache
 
 
 # ---------------------------------------------------------------------------
