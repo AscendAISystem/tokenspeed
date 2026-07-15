@@ -131,17 +131,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
-            self.k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.k_buffer],
-                dtype=torch.uint64,
+            self.data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_buffer + self.v_buffer],
+                dtype=torch.int64,
                 device=self.device,
             )
-            self.v_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.v_buffer],
-                dtype=torch.uint64,
-                device=self.device,
-            )
-            self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
             self.data_strides = torch.tensor(
                 [
                     np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -153,10 +147,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
-        if hasattr(self, "k_data_ptrs"):
-            del self.k_data_ptrs
-        if hasattr(self, "v_data_ptrs"):
-            del self.v_data_ptrs
         if hasattr(self, "data_ptrs"):
             del self.data_ptrs
         if hasattr(self, "data_strides"):
