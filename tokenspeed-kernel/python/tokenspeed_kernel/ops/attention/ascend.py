@@ -200,11 +200,6 @@ def npu_mha_prefill(
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
 
-    # Handle GQA: repeat kv heads to match q heads for NPU fused API
-    if num_kv_heads != num_q_heads:
-        n_reps = num_q_heads // num_kv_heads
-        k = k.repeat_interleave(n_reps, dim=1)
-        v = v.repeat_interleave(n_reps, dim=1)
 
     # Reshape q/k/v: [total, heads, dim] -> [1, heads, total, dim] (BNSD layout)
     # q.unsqueeze(0) -> [1, total_q, num_heads, head_dim]; transpose to BNSD
@@ -345,10 +340,6 @@ def npu_mha_extend_with_kvcache(
     k_bnsd = k_cache.transpose(1, 2)
     v_bnsd = v_cache.transpose(1, 2)
     num_kv_heads = k_cache.shape[2]
-    if num_q_heads != num_kv_heads:
-        n_reps = num_q_heads // num_kv_heads
-        k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
-        v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
     if fused_attn is not None:
         out, _ = fused_attn(
             q_4d, k_bnsd, v_bnsd,
@@ -483,10 +474,6 @@ def npu_mha_decode_with_kvcache(
         # Manually repeat KV heads for GQA during capture so the fused kernel
         # sees num_heads == num_kv_heads (avoids non-power-of-2 ratio issue).
         num_kv_heads = k_cache.shape[2]
-        if num_q_heads != num_kv_heads:
-            n_reps = num_q_heads // num_kv_heads
-            k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
-            v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
         torch.npu.graph_task_group_begin(stream)
         out, _ = fused_attn(
             q_bnsd, k_bnsd, v_bnsd,
@@ -529,13 +516,6 @@ def npu_mha_decode_with_kvcache(
                 # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
                 k_bnsd = k_cache.transpose(1, 2)
                 v_bnsd = v_cache.transpose(1, 2)
-                # Manually repeat KV heads for GQA (NPU fused API has issues with
-                # non-power-of-2 ratios, e.g. Qwen2.5-1.5B with 12:2=6 ratio)
-                num_kv_heads = k_cache.shape[2]
-                if num_q_heads != num_kv_heads:
-                    n_reps = num_q_heads // num_kv_heads
-                    k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
-                    v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
                 out, _ = fused_attn(
                     q_bnsd, k_bnsd, v_bnsd,
                     actual_seq_lengths=seq_lens_list,
