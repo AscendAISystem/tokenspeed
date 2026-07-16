@@ -115,8 +115,15 @@ def npu_mha_prefill(
 
     fused_attn = _get_fused_attention_score()
     num_q_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
+
+    # Handle GQA: repeat kv heads to match q heads for NPU fused API
+    if num_kv_heads != num_q_heads:
+        n_reps = num_q_heads // num_kv_heads
+        k = k.repeat_interleave(n_reps, dim=1)
+        v = v.repeat_interleave(n_reps, dim=1)
 
     # Reshape q/k/v: [total, heads, dim] -> [1, heads, total, dim] (BNSD layout)
     # q.unsqueeze(0) -> [1, total_q, num_heads, head_dim]; transpose to BNSD
