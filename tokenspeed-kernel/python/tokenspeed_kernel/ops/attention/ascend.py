@@ -338,84 +338,117 @@ def npu_mha_decode_with_kvcache(
     scale = 1.0 / math.sqrt(head_dim)
     batch_size = q.shape[0] // max_seqlen_q
 
+    # Detect CUDA graph capture mode: inside torch.npu.graph(), stream sync is
+    # not allowed on Ascend NPU.  We must use only basic tensor ops (matmul,
+    # softmax) and avoid any .item() calls that would trigger a CPU sync.
+    is_capturing = torch.npu.is_current_stream_capturing()
+
     # Reshape q for batch processing
     # q is [batch * max_seqlen_q, num_heads, head_dim]
     # -> [batch, max_seqlen_q, num_heads, head_dim] (PyTorch BSND layout)
     q_4d = q.reshape(batch_size, max_seqlen_q, num_q_heads, head_dim)
 
-    # Try to use NPU fused attention first (fast path), fall back to SDPA
-    use_fused = False
-    if fused_attn is not None:
-        try:
-            # For page attention, actual_seq_lengths_kv is mandatory per NPU API spec
-            seq_lens_list = [int(s) for s in cache_seqlens]
-            # NPU BNSD = [batch, num_heads, seqlen, head_dim]; transpose from BSND
-            q_bnsd = q_4d.transpose(1, 2)
-            # NPU BnNBsD expects k/v as [num_pages, num_kv_heads, page_size, head_dim]
-            # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
-            k_bnsd = k_cache.transpose(1, 2)
-            v_bnsd = v_cache.transpose(1, 2)
-            out, _ = fused_attn(
-                q_bnsd, k_bnsd, v_bnsd,
-                actual_seq_lengths=seq_lens_list,
-                actual_seq_lengths_kv=seq_lens_list,
-                num_heads=num_q_heads,
-                num_key_value_heads=k_cache.shape[2],
-                scale=scale,
-                input_layout="BNSD",
-                block_table=page_table,
-                block_size=k_cache.shape[1],
-            )
-            out = out.reshape(-1, num_q_heads, head_dim)
-            use_fused = True
-        except RuntimeError as e:
-            logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
-    if not use_fused:
-        # Fallback: SDPA decode with proper page table gathering
-        # k_cache shape: [num_pages, page_size, num_kv_heads, head_dim]
+    if is_capturing:
+        # ---- Graph-capture path (manual attention, no CPU sync) ----
+        # During NPU graph capture we cannot call npu_fused_infer_attention_score
+        # (which internally synchronises a copy stream) nor use
+        # scaled_dot_product_attention (which may also trigger CANN kernel sync).
+        # Instead we implement a pure-matmul paged decode that stays on-device.
         num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
-        batch_size = page_table.shape[0]
-        # Gather KV cache using page table
-        # page_table: [batch_size, max_pages_per_seq] with page indices
-        max_pages_per_seq = page_table.shape[1]
-        total_kv_tokens = int(cache_seqlens.sum().item())
-        # For simplicity, handle single-batch decode (most common case for bs=1)
-        if batch_size == 1:
-            num_kv = int(cache_seqlens[0].item())
-            pages = page_table[0, :(num_kv + page_size - 1) // page_size]
-            gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
-            gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
-            # q shape: [batch * max_seqlen_q, num_q_heads, head_dim], max_seqlen_q=1 for decode
-            q_2d = q.reshape(1, -1, num_q_heads, head_dim)  # [1, num_q_heads, 1, head_dim]
-            k_2d = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
-            v_2d = gathered_v.unsqueeze(0)
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_2d.transpose(1, 2),
-                k_2d.transpose(1, 2),
-                v_2d.transpose(1, 2),
-                scale=scale,
-            ).transpose(1, 2).squeeze(0)
-        else:
-            # Multi-batch: process each batch separately
-            outputs = []
-            offset = 0
-            for b in range(batch_size):
-                num_kv = int(cache_seqlens[b].item())
-                pages = page_table[b, :(num_kv + page_size - 1) // page_size]
+        # Use the maximum possible pages per sequence so indexing is data-independent.
+        max_pages = page_table.shape[1]
+        # Gather full kv pages unconditionally; the larger softmax dim is fine at
+        # capture time because the graphs are replayed with real seqlens at runtime.
+        flat_pages = page_table.reshape(-1, max_pages).to(torch.long)  # [B, max_pages]
+        flat_indices = flat_pages.unsqueeze(-1).expand(-1, -1, page_size).reshape(batch_size, -1)
+        gathered_k = k_cache[flat_pages].reshape(batch_size, max_pages * page_size, num_kv_heads, head_dim)
+        gathered_v = v_cache[flat_pages].reshape(batch_size, max_pages * page_size, num_kv_heads, head_dim)
+        # Repeat kv heads for GQA
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            gathered_k = gathered_k.repeat_interleave(n_reps, dim=2)
+            gathered_v = gathered_v.repeat_interleave(n_reps, dim=2)
+        # Manual attention: Q @ K^T / sqrt(d) -> softmax -> @ V
+        # q_4d: [B, Tq, H, D] -> [B, H, Tq, D] for matmul
+        q_bhmd = q_4d.transpose(1, 2)
+        k_bhmd = gathered_k.permute(0, 2, 1, 3)  # [B, H, Tk, D]
+        v_bhmd = gathered_v.permute(0, 2, 1, 3)
+        attn = torch.matmul(q_bhmd, k_bhmd.transpose(-2, -1)) * scale
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v_bhmd).transpose(1, 2).reshape(-1, num_q_heads, head_dim)
+    else:
+        # ---- Normal (non-capturing) path: try fused then SDPA ----
+        use_fused = False
+        if fused_attn is not None:
+            try:
+                # For page attention, actual_seq_lengths_kv is mandatory per NPU API spec
+                seq_lens_list = [int(s) for s in cache_seqlens]
+                # NPU BNSD = [batch, num_heads, seqlen, head_dim]; transpose from BSND
+                q_bnsd = q_4d.transpose(1, 2)
+                # NPU BnNBsD expects k/v as [num_pages, num_kv_heads, page_size, head_dim]
+                # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
+                k_bnsd = k_cache.transpose(1, 2)
+                v_bnsd = v_cache.transpose(1, 2)
+                out, _ = fused_attn(
+                    q_bnsd, k_bnsd, v_bnsd,
+                    actual_seq_lengths=seq_lens_list,
+                    actual_seq_lengths_kv=seq_lens_list,
+                    num_heads=num_q_heads,
+                    num_key_value_heads=k_cache.shape[2],
+                    scale=scale,
+                    input_layout="BNSD",
+                    block_table=page_table,
+                    block_size=k_cache.shape[1],
+                )
+                out = out.reshape(-1, num_q_heads, head_dim)
+                use_fused = True
+            except RuntimeError as e:
+                logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
+        if not use_fused:
+            # Fallback: SDPA decode with proper page table gathering
+            # k_cache shape: [num_pages, page_size, num_kv_heads, head_dim]
+            num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
+            batch_size = page_table.shape[0]
+            # Gather KV cache using page table
+            # page_table: [batch_size, max_pages_per_seq] with page indices
+            max_pages_per_seq = page_table.shape[1]
+            # For simplicity, handle single-batch decode (most common case for bs=1)
+            if batch_size == 1:
+                num_kv = int(cache_seqlens[0].item())
+                pages = page_table[0, :(num_kv + page_size - 1) // page_size]
                 gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
                 gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
-                q_b = q[offset:offset + max_seqlen_q].reshape(1, max_seqlen_q, num_q_heads, head_dim)
-                k_b = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
-                v_b = gathered_v.unsqueeze(0)
-                out_b = torch.nn.functional.scaled_dot_product_attention(
-                    q_b.transpose(1, 2),
-                    k_b.transpose(1, 2),
-                    v_b.transpose(1, 2),
+                # q shape: [batch * max_seqlen_q, num_q_heads, head_dim], max_seqlen_q=1 for decode
+                q_2d = q.reshape(1, -1, num_q_heads, head_dim)  # [1, num_q_heads, 1, head_dim]
+                k_2d = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+                v_2d = gathered_v.unsqueeze(0)
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_2d.transpose(1, 2),
+                    k_2d.transpose(1, 2),
+                    v_2d.transpose(1, 2),
                     scale=scale,
                 ).transpose(1, 2).squeeze(0)
-                outputs.append(out_b)
-                offset += max_seqlen_q
-            out = torch.cat(outputs, dim=0)
+            else:
+                # Multi-batch: process each batch separately
+                outputs = []
+                offset = 0
+                for b in range(batch_size):
+                    num_kv = int(cache_seqlens[b].item())
+                    pages = page_table[b, :(num_kv + page_size - 1) // page_size]
+                    gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                    gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                    q_b = q[offset:offset + max_seqlen_q].reshape(1, max_seqlen_q, num_q_heads, head_dim)
+                    k_b = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+                    v_b = gathered_v.unsqueeze(0)
+                    out_b = torch.nn.functional.scaled_dot_product_attention(
+                        q_b.transpose(1, 2),
+                        k_b.transpose(1, 2),
+                        v_b.transpose(1, 2),
+                        scale=scale,
+                    ).transpose(1, 2).squeeze(0)
+                    outputs.append(out_b)
+                    offset += max_seqlen_q
+                out = torch.cat(outputs, dim=0)
 
     if return_lse:
         lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
