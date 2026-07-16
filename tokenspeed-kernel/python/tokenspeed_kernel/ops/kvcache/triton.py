@@ -109,16 +109,30 @@ def _transfer_kv_per_layer_npu(
     dst_indices: torch.Tensor,
     item_size: int,
 ) -> None:
-    """NPU fallback for per-layer KV transfer using index_select."""
+    """NPU fallback for per-layer KV transfer using index_copy_.
+
+    Handles cross-device copies (NPU source -> CPU destination) by moving
+    selected source data to the destination device first.
+    """
     element_dim = item_size // src_k.element_size()
     k_src_flat = src_k.reshape(-1, element_dim)
     v_src_flat = src_v.reshape(-1, element_dim)
     k_dst_flat = dst_k.reshape(-1, element_dim)
     v_dst_flat = dst_v.reshape(-1, element_dim)
-    src_idx = src_indices.to(torch.int64)
-    dst_idx = dst_indices.to(torch.int64)
-    k_dst_flat.index_copy_(0, dst_idx, k_src_flat.index_select(0, src_idx))
-    v_dst_flat.index_copy_(0, dst_idx, v_src_flat.index_select(0, src_idx))
+    src_idx = src_indices.to(torch.int64, non_blocking=True)
+    dst_idx = dst_indices.to(torch.int64, non_blocking=True)
+
+    # Move indices to the same device as the destination tensor to avoid
+    # cross-device errors in index_copy_.
+    if dst_k.device.type != src_k.device.type:
+        # Device-to-host transfer: copy selected source data to host first
+        k_selected = k_src_flat.index_select(0, src_idx.to(src_k.device)).to(dst_k.device)
+        v_selected = v_src_flat.index_select(0, src_idx.to(src_k.device)).to(dst_k.device)
+        k_dst_flat.index_copy_(0, dst_idx.to(dst_k.device), k_selected)
+        v_dst_flat.index_copy_(0, dst_idx.to(dst_k.device), v_selected)
+    else:
+        k_dst_flat.index_copy_(0, dst_idx, k_src_flat.index_select(0, src_idx))
+        v_dst_flat.index_copy_(0, dst_idx, v_src_flat.index_select(0, src_idx))
 
 
 def _transfer_kv_per_layer_mla_npu(
