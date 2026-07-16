@@ -94,6 +94,12 @@ def update_decode_attn_graph_params(
         return
     if stream is None:
         stream = torch.npu.current_stream()
+    if handles:
+        logger.info(
+            "graph_task_update: updating %d handle(s) seq_lens=%s",
+            len(handles),
+            seq_lens_list,
+        )
     for entry in handles:
         handle = entry["handle"]
         torch.npu.graph_task_update_begin(stream, handle)
@@ -441,6 +447,9 @@ def npu_mha_decode_with_kvcache(
         # they trigger NPU→CPU sync which is forbidden on a captured stream.
         # The seq_lens_list here is a DUMMY placeholder; the real values are
         # passed via update_decode_attn_graph_params() before each replay.
+        logger.info(
+            "npu_mha_decode_with_kvcache: graph capture mode, using graph_task_group"
+        )
         stream = torch.npu.current_stream()
         seq_lens_list = [1] * batch_size  # dummy; real values set via graph_task_update
         # NPU BNSD layout: [batch, num_heads, seqlen, head_dim]
