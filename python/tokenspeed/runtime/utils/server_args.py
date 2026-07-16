@@ -265,7 +265,6 @@ class ServerArgs:
     # parallel strategy
     nprocs_per_node: int | None = None
     world_size: int | None = None
-    pipeline_parallel_size: int | None = None
     attn_tp_size: int | None = None
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
@@ -439,12 +438,8 @@ class ServerArgs:
         if ENABLE_CP:
             attn_cp_size, attn_tp_size = attn_tp_size, 1
 
-        # Pipeline parallel size: used as a multiplier for world_size
-        pp_size = self.pipeline_parallel_size
         if world_size is None:
             world_size = 1
-            if pp_size is not None:
-                world_size *= pp_size
             if attn_tp_size is not None:
                 world_size *= attn_tp_size
             if attn_cp_size is not None:
@@ -452,21 +447,14 @@ class ServerArgs:
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
-                "Inferred world_size (%s) from pp_size (%s) x attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s)",
+                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s)",
                 world_size,
-                pp_size,
                 attn_tp_size,
                 attn_cp_size,
                 attn_dp_size,
             )
         else:
             logger.info("Specified world_size (%s)", world_size)
-
-        # Auto-set nprocs_per_node from pipeline_parallel_size if not specified
-        if nprocs_per_node is None and pp_size is not None and pp_size > 1:
-            nprocs_per_node = pp_size
-            self.nprocs_per_node = nprocs_per_node
-            logger.info("Auto-set nprocs_per_node=%s from pipeline_parallel_size=%s", nprocs_per_node, pp_size)
 
         attn_tp_size, attn_cp_size, attn_dp_size = _resolve_parallelism_sizes(
             world_size, attn_tp_size, attn_cp_size, attn_dp_size
@@ -1745,13 +1733,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.nprocs_per_node,
             help="Number of processes to start per node",
-        )
-        parser.add_argument(
-            "--pipeline-parallel-size",
-            "--pp",
-            type=int,
-            default=ServerArgs.pipeline_parallel_size,
-            help="Pipeline parallelism size. Sets the number of pipeline stages.",
         )
         parser.add_argument(
             "--world-size",
