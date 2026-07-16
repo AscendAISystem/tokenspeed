@@ -329,11 +329,21 @@ def npu_mha_extend_with_kvcache(
     seq_lens_kv = [int(s) for s in cache_seqlens]
 
     # Reshape query: [total_q, heads, dim] -> [1, heads, total_q, dim] (BNSD)
-    q_4d = q.unsqueeze(0)  # [1, total_q, num_heads, head_dim]
+    q_4d = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_q, head_dim]
 
+    # ---- BNSD layout + GQA handling ----
+    # k_cache: [num_pages, page_size, num_kv_heads, head_dim] → transpose to
+    # [num_pages, num_kv_heads, page_size, head_dim] for BNSD page layout
+    k_bnsd = k_cache.transpose(1, 2)
+    v_bnsd = v_cache.transpose(1, 2)
+    num_kv_heads = k_cache.shape[2]
+    if num_q_heads != num_kv_heads:
+        n_reps = num_q_heads // num_kv_heads
+        k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
+        v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
     if fused_attn is not None:
         out, _ = fused_attn(
-            q_4d, k_cache, v_cache,
+            q_4d, k_bnsd, v_bnsd,
             actual_seq_lengths=seq_lens_q,
             actual_seq_lengths_kv=seq_lens_kv,
             num_heads=num_q_heads,
@@ -456,13 +466,20 @@ def npu_mha_decode_with_kvcache(
         q_bnsd = q_4d.transpose(1, 2)  # [B, H_q, Tq, D]
         k_bnsd = k_cache.transpose(1, 2)  # [num_pages, num_kv_heads, P, D]
         v_bnsd = v_cache.transpose(1, 2)
+        # Manually repeat KV heads for GQA during capture so the fused kernel
+        # sees num_heads == num_kv_heads (avoids non-power-of-2 ratio issue).
+        num_kv_heads = k_cache.shape[2]
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
+            v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
         torch.npu.graph_task_group_begin(stream)
         out, _ = fused_attn(
             q_bnsd, k_bnsd, v_bnsd,
             actual_seq_lengths=seq_lens_list,
             actual_seq_lengths_kv=seq_lens_list,
             num_heads=num_q_heads,
-            num_key_value_heads=k_cache.shape[2],
+            num_key_value_heads=k_bnsd.shape[1],
             scale=scale,
             input_layout="BNSD",
             block_table=page_table,
@@ -470,13 +487,16 @@ def npu_mha_decode_with_kvcache(
         )
         handle = torch.npu.graph_task_group_end(stream)
         # Store handle + tensor references for pre-replay parameter update.
+        # NOTE: k/v tensors already have repeated heads, so num_key_value_heads
+        # equals num_q_heads. The graph_task_update path uses these stored
+        # tensors directly, so it naturally sees the repeated layout.
         _decode_attn_capture_handles.append({
             "handle": handle,
             "q": q_bnsd,
             "k": k_bnsd,
             "v": v_bnsd,
             "num_heads": num_q_heads,
-            "num_key_value_heads": k_cache.shape[2],
+            "num_key_value_heads": k_bnsd.shape[1],
             "scale": scale,
             "block_table": page_table,
             "block_size": k_cache.shape[1],
@@ -495,12 +515,19 @@ def npu_mha_decode_with_kvcache(
                 # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
                 k_bnsd = k_cache.transpose(1, 2)
                 v_bnsd = v_cache.transpose(1, 2)
+                # Manually repeat KV heads for GQA (NPU fused API has issues with
+                # non-power-of-2 ratios, e.g. Qwen2.5-1.5B with 12:2=6 ratio)
+                num_kv_heads = k_cache.shape[2]
+                if num_q_heads != num_kv_heads:
+                    n_reps = num_q_heads // num_kv_heads
+                    k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
+                    v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
                 out, _ = fused_attn(
                     q_bnsd, k_bnsd, v_bnsd,
                     actual_seq_lengths=seq_lens_list,
                     actual_seq_lengths_kv=seq_lens_list,
                     num_heads=num_q_heads,
-                    num_key_value_heads=k_cache.shape[2],
+                    num_key_value_heads=k_bnsd.shape[1],
                     scale=scale,
                     input_layout="BNSD",
                     block_table=page_table,
