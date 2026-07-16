@@ -433,6 +433,20 @@ class MHATokenToKVPoolHost(HostKVCache):
         block_quota: int | None = None,
     ):
         if io_backend == "kernel":
+            # NPU: loop through layers with transfer_kv_per_layer
+            # which uses index_copy_ as a PyTorch-native fallback
+            if _platform.is_npu:
+                for layer_idx in range(self.layer_num):
+                    transfer_kv_per_layer(
+                        src_k=device_pool.k_buffer[layer_idx],
+                        dst_k=self.k_buffer[layer_idx],
+                        src_v=device_pool.v_buffer[layer_idx],
+                        dst_v=self.v_buffer[layer_idx],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+                return
             if self.layout == "layer_first":
                 transfer_kv_all_layer(
                     src_k_layers=device_pool.k_data_ptrs,
