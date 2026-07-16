@@ -434,18 +434,30 @@ class Engine(EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
+    from tokenspeed.runtime.utils.device_utils import is_npu_available
+
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
-    if not server_args.enable_symm_mem:
-        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-    os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    if not server_args.disable_tf32:
-        # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
-        # explicit env wins; --disable-tf32 is the documented opt-out.
-        os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
-        os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+
+    is_npu = is_npu_available()
+    if is_npu:
+        # On NPU (Ascend), disable torch.compile to avoid Triton driver
+        # conflicts (torch.compile with inductor backend triggers Triton
+        # driver detection which is incompatible with Ascend NPU).
+        os.environ.setdefault("TORCH_COMPILE_BACKEND", "eager")
+        os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+        # Skip CUDA/NVIDIA-specific env vars on NPU
+    else:
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
+        if not server_args.enable_symm_mem:
+            os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+        os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+        if not server_args.disable_tf32:
+            # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
+            # explicit env wins; --disable-tf32 is the documented opt-out.
+            os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
+            os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
 
     # Set prometheus env vars
     if server_args.enable_metrics:
