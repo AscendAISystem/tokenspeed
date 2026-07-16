@@ -235,10 +235,17 @@ def npu_mha_prefill(
         out = out.squeeze(0).transpose(0, 1)  # [total_q, num_heads, head_dim]
     else:
         # Fallback: use PyTorch SDPA when NPU API is unavailable
+        # GQA repeat for SDPA fallback
+        k_sdpa = k
+        v_sdpa = v
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            k_sdpa = k.repeat_interleave(n_reps, dim=1)
+            v_sdpa = v.repeat_interleave(n_reps, dim=1)
         out = torch.nn.functional.scaled_dot_product_attention(
             q.unsqueeze(0).transpose(1, 2),  # [1, heads, total, dim]
-            k.unsqueeze(0).transpose(1, 2),
-            v.unsqueeze(0).transpose(1, 2),
+            k_sdpa.unsqueeze(0).transpose(1, 2),
+            v_sdpa.unsqueeze(0).transpose(1, 2),
             scale=scale,
             is_causal=True,
         ).transpose(1, 2).squeeze(0)
@@ -358,6 +365,11 @@ def npu_mha_extend_with_kvcache(
         # Fallback: SDPA with cached KV
         k_contiguous = k_cache.reshape(-1, k_cache.shape[2], k_cache.shape[3])
         v_contiguous = v_cache.reshape(-1, v_cache.shape[2], v_cache.shape[3])
+        # GQA repeat for SDPA fallback
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            k_contiguous = k_contiguous.repeat_interleave(n_reps, dim=1)
+            v_contiguous = v_contiguous.repeat_interleave(n_reps, dim=1)
         out = torch.nn.functional.scaled_dot_product_attention(
             q.unsqueeze(0).transpose(1, 2),
             k_contiguous.unsqueeze(0).transpose(1, 2),
@@ -551,6 +563,11 @@ def npu_mha_decode_with_kvcache(
                 pages = page_table[0, :(num_kv + page_size - 1) // page_size]
                 gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
                 gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                # GQA repeat for SDPA fallback
+                if num_q_heads != num_kv_heads:
+                    n_reps = num_q_heads // num_kv_heads
+                    gathered_k = gathered_k.repeat_interleave(n_reps, dim=1)
+                    gathered_v = gathered_v.repeat_interleave(n_reps, dim=1)
                 # q shape: [batch * max_seqlen_q, num_q_heads, head_dim], max_seqlen_q=1 for decode
                 q_2d = q.reshape(1, -1, num_q_heads, head_dim)  # [1, num_q_heads, 1, head_dim]
                 k_2d = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
@@ -570,6 +587,11 @@ def npu_mha_decode_with_kvcache(
                     pages = page_table[b, :(num_kv + page_size - 1) // page_size]
                     gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
                     gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
+                    # GQA repeat for SDPA fallback
+                    if num_q_heads != num_kv_heads:
+                        n_reps = num_q_heads // num_kv_heads
+                        gathered_k = gathered_k.repeat_interleave(n_reps, dim=1)
+                        gathered_v = gathered_v.repeat_interleave(n_reps, dim=1)
                     q_b = q[offset:offset + max_seqlen_q].reshape(1, max_seqlen_q, num_q_heads, head_dim)
                     k_b = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
                     v_b = gathered_v.unsqueeze(0)
