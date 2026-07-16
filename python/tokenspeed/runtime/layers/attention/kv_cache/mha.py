@@ -163,6 +163,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 dtype=ptr_dtype,
                 device=self.device,
             )
+            self.k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.k_buffer],
+                dtype=ptr_dtype,
+                device=self.device,
+            )
+            self.v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.v_buffer],
+                dtype=ptr_dtype,
+                device=self.device,
+            )
             self.data_strides = torch.tensor(
                 [
                     np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -176,6 +186,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         del self.v_buffer
         if hasattr(self, "data_ptrs"):
             del self.data_ptrs
+        if hasattr(self, "k_data_ptrs"):
+            del self.k_data_ptrs
+        if hasattr(self, "v_data_ptrs"):
+            del self.v_data_ptrs
         if hasattr(self, "data_strides"):
             del self.data_strides
 
