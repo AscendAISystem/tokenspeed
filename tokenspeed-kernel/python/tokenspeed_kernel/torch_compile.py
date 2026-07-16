@@ -20,6 +20,24 @@
 
 from __future__ import annotations
 
+import torch
+
+
+def _is_npu() -> bool:
+    """Detect Ascend NPU without heavy imports."""
+    try:
+        return torch.npu.is_available()
+    except AttributeError:
+        return False
+
 
 def get_compiler_backend() -> str:
+    """Return the torch.compile backend.
+
+    On NPU platforms, ``torch.compile`` with ``inductor`` backend triggers
+    Triton driver detection which is incompatible with Ascend NPU, so fall
+    back to ``eager`` (no compilation) on NPU.
+    """
+    if _is_npu():
+        return "eager"
     return "inductor"
