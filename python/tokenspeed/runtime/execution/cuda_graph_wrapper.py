@@ -283,6 +283,7 @@ class CudaGraphWrapper:
         )
         self.graphs: dict[tuple[str, int], torch.npu.NPUGraph] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self._attn_task_handles: dict[tuple[str, int], list[dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -508,6 +509,16 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
+        # Retrieve graph_task handles captured inside the forward pass.
+        # These are used by __call__ to hot-update attention parameters
+        # (seq_lens, block_table) before each replay.
+        from tokenspeed_kernel.ops.attention.ascend import (  # type: ignore[import-untyped]  # noqa: I001
+            get_decode_attn_capture_handles,
+        )
+
+        self._attn_task_handles[(variant, bs)] = get_decode_attn_capture_handles()
+
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
@@ -990,7 +1001,22 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
+            # --- Hot-update graph_task attention params before replay ---
+            # Replace capture-time dummy seq_lens / block_table with live values
+            # so npu_fused_infer_attention_score inside the captured graph uses
+            # the correct per-request KV lengths and page mappings at every step.
             graph_key = self._cuda_graph_key(padded_bs)
+            attn_handles = self._attn_task_handles.get(graph_key, [])
+            if attn_handles:
+                from tokenspeed_kernel.ops.attention.ascend import (  # type: ignore[import-untyped]  # noqa: I001
+                    update_decode_attn_graph_params,
+                )
+
+                # Extract live sequence lengths (seq_lens is already updated by
+                # _init_replay_metadata above, shape [padded_bs]).
+                current_seq_lens = [int(s) for s in seq_lens[:padded_bs]]
+                update_decode_attn_graph_params(attn_handles, current_seq_lens)
+
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[graph_key].replay()
 

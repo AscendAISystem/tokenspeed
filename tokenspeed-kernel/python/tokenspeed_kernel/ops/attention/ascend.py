@@ -39,6 +39,81 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 # ---------------------------------------------------------------------------
+# Graph task update support (for NPU graph capture with fused attention)
+# ---------------------------------------------------------------------------
+# Stores handles + tensor references created during graph capture so that
+# ``cuda_graph_wrapper.py`` can hot-update parameters before each replay.
+#
+# Lifecycle:
+#   capture → npu_mha_decode_with_kvcache() appends handle entries
+#          → cuda_graph_wrapper retrieves them via get_decode_attn_capture_handles()
+#   replay  → cuda_graph_wrapper calls update_decode_attn_graph_params()
+#             before graph.replay() with current sequence lengths
+
+_decode_attn_capture_handles: list[dict] = []
+
+
+def get_decode_attn_capture_handles() -> list[dict]:
+    """Return all stored capture handles for decode attention and clear list.
+
+    Called by ``cuda_graph_wrapper`` after each graph capture session.
+    Each dict contains:
+        handle      – opaque handle from ``graph_task_group_end``
+        q/k/v       – tensor references (views of persistent buffers)
+        num_heads,
+        num_kv_heads,
+        scale,
+        block_size  – static parameters from capture
+        block_table – page_table tensor reference (contents updated in-place)
+    """
+    handles = _decode_attn_capture_handles[:]
+    _decode_attn_capture_handles.clear()
+    return handles
+
+
+def update_decode_attn_graph_params(
+    handles: list[dict],
+    seq_lens_list: list[int],
+    stream: torch.npu.Stream | None = None,
+) -> None:
+    """Hot-update captured decode attention parameters before graph replay.
+
+    Must be called on the capture stream **before** ``graph.replay()``.
+
+    Args:
+        handles: List of handle dicts from ``get_decode_attn_capture_handles()``.
+        seq_lens_list: Current per-batch sequence lengths as Python ``list[int]``.
+                       These replace the capture-time dummy seq_lens.
+        stream: NPU stream for the update.  Defaults to current stream.
+    """
+    fused_attn = _get_fused_attention_score()
+    if fused_attn is None:
+        logger.warning(
+            "update_decode_attn_graph_params: fused_attn unavailable, skipping"
+        )
+        return
+    if stream is None:
+        stream = torch.npu.current_stream()
+    for entry in handles:
+        handle = entry["handle"]
+        torch.npu.graph_task_update_begin(stream, handle)
+        fused_attn(
+            entry["q"],
+            entry["k"],
+            entry["v"],
+            actual_seq_lengths=seq_lens_list,
+            actual_seq_lengths_kv=seq_lens_list,
+            num_heads=entry["num_heads"],
+            num_key_value_heads=entry["num_key_value_heads"],
+            scale=entry["scale"],
+            input_layout="BNSD",
+            block_table=entry["block_table"],
+            block_size=entry["block_size"],
+        )
+        torch.npu.graph_task_update_end(stream)
+
+
+# ---------------------------------------------------------------------------
 # NPU availability helpers
 # ---------------------------------------------------------------------------
 
@@ -356,33 +431,48 @@ def npu_mha_decode_with_kvcache(
     q_4d = q.reshape(batch_size, max_seqlen_q, num_q_heads, head_dim)
 
     if is_capturing:
-        # ---- Graph-capture path (manual attention, no CPU sync) ----
-        # During NPU graph capture we cannot call npu_fused_infer_attention_score
-        # (which internally synchronises a copy stream) nor use
-        # scaled_dot_product_attention (which may also trigger CANN kernel sync).
-        # Instead we implement a pure-matmul paged decode that stays on-device.
-        num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
-        # Use the maximum possible pages per sequence so indexing is data-independent.
-        max_pages = page_table.shape[1]
-        # Gather full kv pages unconditionally; the larger softmax dim is fine at
-        # capture time because the graphs are replayed with real seqlens at runtime.
-        flat_pages = page_table.reshape(-1, max_pages).to(torch.long)  # [B, max_pages]
-        flat_indices = flat_pages.unsqueeze(-1).expand(-1, -1, page_size).reshape(batch_size, -1)
-        gathered_k = k_cache[flat_pages].reshape(batch_size, max_pages * page_size, num_kv_heads, head_dim)
-        gathered_v = v_cache[flat_pages].reshape(batch_size, max_pages * page_size, num_kv_heads, head_dim)
-        # Repeat kv heads for GQA
-        if num_q_heads != num_kv_heads:
-            n_reps = num_q_heads // num_kv_heads
-            gathered_k = gathered_k.repeat_interleave(n_reps, dim=2)
-            gathered_v = gathered_v.repeat_interleave(n_reps, dim=2)
-        # Manual attention: Q @ K^T / sqrt(d) -> softmax -> @ V
-        # q_4d: [B, Tq, H, D] -> [B, H, Tq, D] for matmul
-        q_bhmd = q_4d.transpose(1, 2)
-        k_bhmd = gathered_k.permute(0, 2, 1, 3)  # [B, H, Tk, D]
-        v_bhmd = gathered_v.permute(0, 2, 1, 3)
-        attn = torch.matmul(q_bhmd, k_bhmd.transpose(-2, -1)) * scale
-        attn = torch.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_bhmd).transpose(1, 2).reshape(-1, num_q_heads, head_dim)
+        # ---- Graph-capture path with fused attention + graph_task_group ----
+        # Use graph_task_group_begin/end to wrap npu_fused_infer_attention_score
+        # so its parameters (seq_lens, block_table) can be hot-updated via
+        # graph_task_update before each replay, avoiding the performance
+        # penalty of manual matmul (padded KV, ~3 kernels vs 1 fused kernel).
+        #
+        # During capture we MUST avoid any .item() / int(tensor) calls because
+        # they trigger NPU→CPU sync which is forbidden on a captured stream.
+        # The seq_lens_list here is a DUMMY placeholder; the real values are
+        # passed via update_decode_attn_graph_params() before each replay.
+        stream = torch.npu.current_stream()
+        seq_lens_list = [1] * batch_size  # dummy; real values set via graph_task_update
+        # NPU BNSD layout: [batch, num_heads, seqlen, head_dim]
+        q_bnsd = q_4d.transpose(1, 2)  # [B, H_q, Tq, D]
+        k_bnsd = k_cache.transpose(1, 2)  # [num_pages, num_kv_heads, P, D]
+        v_bnsd = v_cache.transpose(1, 2)
+        torch.npu.graph_task_group_begin(stream)
+        out, _ = fused_attn(
+            q_bnsd, k_bnsd, v_bnsd,
+            actual_seq_lengths=seq_lens_list,
+            actual_seq_lengths_kv=seq_lens_list,
+            num_heads=num_q_heads,
+            num_key_value_heads=k_cache.shape[2],
+            scale=scale,
+            input_layout="BNSD",
+            block_table=page_table,
+            block_size=k_cache.shape[1],
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        # Store handle + tensor references for pre-replay parameter update.
+        _decode_attn_capture_handles.append({
+            "handle": handle,
+            "q": q_bnsd,
+            "k": k_bnsd,
+            "v": v_bnsd,
+            "num_heads": num_q_heads,
+            "num_key_value_heads": k_cache.shape[2],
+            "scale": scale,
+            "block_table": page_table,
+            "block_size": k_cache.shape[1],
+        })
+        out = out.reshape(-1, num_q_heads, head_dim)
     else:
         # ---- Normal (non-capturing) path: try fused then SDPA ----
         use_fused = False
