@@ -139,23 +139,18 @@ class RMSNorm(torch.nn.Module):
                 return x
 
         if _is_npu:
+            # Use PyTorch F.rms_norm directly (bit-exact on NPU).
+            # npu_add_rms_norm (CANN fusion kernel) has ~4.5% bfloat16 error.
             if residual is not None:
                 if inplace:
                     raise ValueError(
                         "fused add rmsnorm does not support inplace operation"
                     )
-                return ascend_rmsnorm(
-                    x,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    residual=residual,
-                )
-            return ascend_rmsnorm(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                out=x if inplace else None,
-            )
+                x = x + residual
+                residual_out = x.clone()
+                normed = F.rms_norm(x.float(), (x.shape[-1],), weight=self.weight.float(), eps=self.variance_epsilon)
+                return normed.to(x.dtype), residual_out
+            return F.rms_norm(x.float(), (x.shape[-1],), weight=self.weight.float(), eps=self.variance_epsilon).to(x.dtype)
         elif _is_amd:
             if residual is not None:
                 if inplace:

@@ -190,61 +190,32 @@ def npu_mha_prefill(
         Attention output ``[total_q, num_q_heads, head_dim]``, or
         ``(output, lse)`` when ``return_lse`` is True.
     """
-    del cu_seqlens_cpu, sinks  # Not used in NPU path (handled by fused kernel)
+    del cu_seqlens_cpu, sinks
     if not _is_npu_available():
         raise RuntimeError("NPU not available")
 
-    fused_attn = _get_fused_attention_score()
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
 
-
-    # Reshape q/k/v: [total, heads, dim] -> [1, heads, total, dim] (BNSD layout)
-    # q.unsqueeze(0) -> [1, total_q, num_heads, head_dim]; transpose to BNSD
-    q_4d = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_q, head_dim]
-    k_4d = k.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_kv, head_dim]
-    v_4d = v.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_kv, head_dim]
-
-    # Build per-batch sequence lengths from cu_seqlens
-    batch_size = cu_seqlens.shape[0] - 1
-    seq_lens = []
-    for i in range(batch_size):
-        seq_lens.append(int(cu_seqlens[i + 1] - cu_seqlens[i]))
-    actual_seq_lengths = seq_lens
-
-    sparse_mode = 2 if window_left > 0 else 0
-
-    if fused_attn is not None:
-        out, _ = fused_attn(
-            q_4d, k_4d, v_4d,
-            actual_seq_lengths=actual_seq_lengths,
-            num_heads=num_q_heads,
-            num_key_value_heads=num_kv_heads,
-            scale=scale,
-            input_layout="BNSD",
-            sparse_mode=sparse_mode,
-        )
-        # out from NPU: [batch, num_heads, total_q, head_dim]; squeeze batch then
-        # transpose back to [total_q, num_heads, head_dim]
-        out = out.squeeze(0).transpose(0, 1)  # [total_q, num_heads, head_dim]
-    else:
-        # Fallback: use PyTorch SDPA when NPU API is unavailable
-        # GQA repeat for SDPA fallback
-        k_sdpa = k
-        v_sdpa = v
-        if num_q_heads != num_kv_heads:
-            n_reps = num_q_heads // num_kv_heads
-            k_sdpa = k.repeat_interleave(n_reps, dim=1)
-            v_sdpa = v.repeat_interleave(n_reps, dim=1)
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q.unsqueeze(0).transpose(1, 2),  # [1, heads, total, dim]
-            k_sdpa.unsqueeze(0).transpose(1, 2),
-            v_sdpa.unsqueeze(0).transpose(1, 2),
-            scale=scale,
-            is_causal=True,
-        ).transpose(1, 2).squeeze(0)
+    # Use SDPA for prefill — CANN fused kernel's sparse_mode=0 is non-causal,
+    # which produces wrong hidden states during autoregressive prefill
+    # (each token attends to future tokens, corrupting KV cache).
+    # SDPA with is_causal=True is the correct causal masking.
+    k_sdpa = k
+    v_sdpa = v
+    if num_q_heads != num_kv_heads:
+        n_reps = num_q_heads // num_kv_heads
+        k_sdpa = k.repeat_interleave(n_reps, dim=1)
+        v_sdpa = v.repeat_interleave(n_reps, dim=1)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(0).transpose(1, 2),
+        k_sdpa.unsqueeze(0).transpose(1, 2),
+        v_sdpa.unsqueeze(0).transpose(1, 2),
+        scale=scale,
+        is_causal=True,
+    ).transpose(1, 2).squeeze(0)
 
     if return_lse:
         lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
@@ -341,12 +312,21 @@ def npu_mha_extend_with_kvcache(
     v_bnsd = v_cache.transpose(1, 2)
     num_kv_heads = k_cache.shape[2]
     if fused_attn is not None:
+        # Manually repeat KV heads for GQA to avoid CANN non-power-of-2 ratio issue
+        k_fused = k_bnsd
+        v_fused = v_bnsd
+        kv_heads = num_kv_heads
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            k_fused = k_bnsd.repeat_interleave(n_reps, dim=1)
+            v_fused = v_bnsd.repeat_interleave(n_reps, dim=1)
+            kv_heads = num_q_heads
         out, _ = fused_attn(
-            q_4d, k_bnsd, v_bnsd,
+            q_4d, k_fused, v_fused,
             actual_seq_lengths=seq_lens_q,
             actual_seq_lengths_kv=seq_lens_kv,
             num_heads=num_q_heads,
-            num_key_value_heads=num_kv_heads,
+            num_key_value_heads=kv_heads,
             scale=scale,
             input_layout="BNSD",
             block_table=page_table,
@@ -506,22 +486,24 @@ def npu_mha_decode_with_kvcache(
     else:
         # ---- Normal (non-capturing) path: try fused then SDPA ----
         use_fused = False
+        fused_kv_heads = k_cache.shape[2]
         if fused_attn is not None:
             try:
-                # For page attention, actual_seq_lengths_kv is mandatory per NPU API spec
                 seq_lens_list = [int(s) for s in cache_seqlens]
-                # NPU BNSD = [batch, num_heads, seqlen, head_dim]; transpose from BSND
                 q_bnsd = q_4d.transpose(1, 2)
-                # NPU BnNBsD expects k/v as [num_pages, num_kv_heads, page_size, head_dim]
-                # Our k_cache is [num_pages, page_size, num_kv_heads, head_dim]; transpose
                 k_bnsd = k_cache.transpose(1, 2)
                 v_bnsd = v_cache.transpose(1, 2)
+                # Manually repeat KV heads for GQA to avoid CANN non-power-of-2 ratio issue
+                if num_q_heads != fused_kv_heads:
+                    n_reps = num_q_heads // fused_kv_heads
+                    k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
+                    v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
                 out, _ = fused_attn(
                     q_bnsd, k_bnsd, v_bnsd,
                     actual_seq_lengths=seq_lens_list,
                     actual_seq_lengths_kv=seq_lens_list,
                     num_heads=num_q_heads,
-                    num_key_value_heads=k_bnsd.shape[1],
+                    num_key_value_heads=num_q_heads,
                     scale=scale,
                     input_layout="BNSD",
                     block_table=page_table,
@@ -533,26 +515,20 @@ def npu_mha_decode_with_kvcache(
                 logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
         if not use_fused:
             # Fallback: SDPA decode with proper page table gathering
-            # k_cache shape: [num_pages, page_size, num_kv_heads, head_dim]
             num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
             batch_size = page_table.shape[0]
-            # Gather KV cache using page table
-            # page_table: [batch_size, max_pages_per_seq] with page indices
             max_pages_per_seq = page_table.shape[1]
-            # For simplicity, handle single-batch decode (most common case for bs=1)
             if batch_size == 1:
                 num_kv = int(cache_seqlens[0].item())
                 pages = page_table[0, :(num_kv + page_size - 1) // page_size]
                 gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
                 gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
-                # GQA repeat for SDPA fallback
                 if num_q_heads != num_kv_heads:
                     n_reps = num_q_heads // num_kv_heads
                     gathered_k = gathered_k.repeat_interleave(n_reps, dim=1)
                     gathered_v = gathered_v.repeat_interleave(n_reps, dim=1)
-                # q shape: [batch * max_seqlen_q, num_q_heads, head_dim], max_seqlen_q=1 for decode
-                q_2d = q.reshape(1, -1, num_q_heads, head_dim)  # [1, num_q_heads, 1, head_dim]
-                k_2d = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+                q_2d = q.reshape(1, -1, num_q_heads, head_dim)
+                k_2d = gathered_k.unsqueeze(0)
                 v_2d = gathered_v.unsqueeze(0)
                 out = torch.nn.functional.scaled_dot_product_attention(
                     q_2d.transpose(1, 2),
@@ -561,7 +537,6 @@ def npu_mha_decode_with_kvcache(
                     scale=scale,
                 ).transpose(1, 2).squeeze(0)
             else:
-                # Multi-batch: process each batch separately
                 outputs = []
                 offset = 0
                 for b in range(batch_size):
@@ -569,13 +544,12 @@ def npu_mha_decode_with_kvcache(
                     pages = page_table[b, :(num_kv + page_size - 1) // page_size]
                     gathered_k = k_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
                     gathered_v = v_cache[pages.long()].reshape(-1, num_kv_heads, head_dim)[:num_kv]
-                    # GQA repeat for SDPA fallback
                     if num_q_heads != num_kv_heads:
                         n_reps = num_q_heads // num_kv_heads
                         gathered_k = gathered_k.repeat_interleave(n_reps, dim=1)
                         gathered_v = gathered_v.repeat_interleave(n_reps, dim=1)
                     q_b = q[offset:offset + max_seqlen_q].reshape(1, max_seqlen_q, num_q_heads, head_dim)
-                    k_b = gathered_k.unsqueeze(0)  # [1, num_kv, num_kv_heads, head_dim]
+                    k_b = gathered_k.unsqueeze(0)
                     v_b = gathered_v.unsqueeze(0)
                     out_b = torch.nn.functional.scaled_dot_product_attention(
                         q_b.transpose(1, 2),

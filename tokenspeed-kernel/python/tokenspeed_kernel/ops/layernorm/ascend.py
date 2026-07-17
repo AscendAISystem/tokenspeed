@@ -108,37 +108,21 @@ def rmsnorm(
     # Ensure weight dtype matches input dtype (NPU kernel requires matching dtypes)
     weight_cast = weight.to(x.dtype) if weight.dtype != x.dtype else weight
 
-    out_prealloc = out is not None
-    add_rms_norm = _get_npu_add_rms_norm()
-    if add_rms_norm is not None and residual is not None:
-        # npu_add_rms_norm(x, residual, weight, eps) -> (output, norm_scale, new_residual)
-        residual_2d = residual.reshape(-1, hidden_size)
-        result_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight_cast, eps)
-        if out_prealloc:
-            out.reshape(-1, hidden_size).copy_(result_2d)
-        residual_out = residual_out_2d.reshape(residual.shape)
-        return (out.reshape(x.shape) if out_prealloc else result_2d.reshape(x.shape)), residual_out
-    elif add_rms_norm is not None:
-        # Use npu_add_rms_norm without residual (returns output, norm_scale, updated_input)
-        result_2d, _, _ = add_rms_norm(x_2d, x_2d, weight_cast, eps)
-        if out_prealloc:
-            out.reshape(-1, hidden_size).copy_(result_2d)
-            return out.reshape(x.shape)
-        return result_2d.reshape(x.shape)
+    # NOTE: npu_add_rms_norm has ~4.5% bfloat16 precision error on CANN 26.0.rc1
+    # (verified by layer-by-layer comparison). Use F.rms_norm which is bit-exact
+    # between CPU and NPU (diff=0.000000).
+    if residual is not None:
+        x = x + residual
+        residual_out = x.clone()
+        result = F.rms_norm(x, (hidden_size,), weight=weight, eps=eps)
+        if out is not None:
+            out.copy_(result)
+        return out.reshape(x.shape) if out is not None else result, residual_out
     else:
-        # Fallback: F.rms_norm
-        if residual is not None:
-            x = x + residual
-            residual_out = x.clone()
-            result = F.rms_norm(x, (hidden_size,), weight=weight, eps=eps)
-            if out is not None:
-                out.copy_(result)
-            return out.reshape(x.shape) if out is not None else result, residual_out
-        else:
-            result = F.rms_norm(x, (hidden_size,), weight=weight, eps=eps)
-            if out is not None:
-                out.copy_(result)
-            return out.reshape(x.shape) if out is not None else result
+        result = F.rms_norm(x, (hidden_size,), weight=weight, eps=eps)
+        if out is not None:
+            out.copy_(result)
+        return out.reshape(x.shape) if out is not None else result
 
 
 # ---------------------------------------------------------------------------
@@ -173,18 +157,10 @@ def fused_add_rmsnorm(
     x_2d = x.reshape(-1, hidden_size)
     residual_2d = residual.reshape(-1, hidden_size)
 
-    # Ensure weight dtype matches input dtype
-    weight_cast = weight.to(x.dtype) if weight.dtype != x.dtype else weight
-
-    add_rms_norm = _get_npu_add_rms_norm()
-    if add_rms_norm is not None:
-        out_2d, _, residual_out_2d = add_rms_norm(x_2d, residual_2d, weight_cast, eps)
-        out = out_2d.reshape(x.shape)
-        residual_out = residual_out_2d.reshape(residual.shape)
-    else:
-        # Fallback
-        residual_out = x + residual
-        out = F.rms_norm(residual_out, (hidden_size,), weight=weight, eps=eps)
+    # NOTE: npu_add_rms_norm has ~4.5% bfloat16 precision error on CANN 26.0.rc1.
+    # Use F.rms_norm which is bit-exact between CPU and NPU.
+    residual_out = x + residual
+    out = F.rms_norm(residual_out, (hidden_size,), weight=weight, eps=eps)
 
     return out, residual_out
 

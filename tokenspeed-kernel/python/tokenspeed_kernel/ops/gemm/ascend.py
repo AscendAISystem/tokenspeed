@@ -137,12 +137,9 @@ def npu_mm(
     if not _is_npu_available():
         raise RuntimeError("NPU not available")
 
-    # Handle weight format: B may be [N, K] (transposed layout) or [K, N].
-    # When B.shape[0] != A.shape[-1], B is in [N, K] layout → transpose to [K, N].
-    if B.shape[0] == A.shape[-1]:
-        out = torch.matmul(A, B)
-    else:
-        out = torch.matmul(A, B.T)
+    # B is always stored as [N, K] = [out_features, in_features]
+    # F.linear(x, weight) = x @ weight.T, so we need A @ B.T
+    out = torch.matmul(A, B.T)
 
     if out_dtype is not None and out.dtype != out_dtype:
         out = out.to(out_dtype)
