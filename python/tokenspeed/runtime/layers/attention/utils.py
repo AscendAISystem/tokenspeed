@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +29,8 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.utils import get_available_gpu_memory
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -136,9 +140,45 @@ def profile_available_cache_memory_bytes(
         distributed=tp_size > 1,
         cpu_group=cpu_group,
     )
-    cache_memory = available_gpu_memory - total_gpu_memory * (
+    # Query the *total* physical GPU memory for the reservation calculation.
+    # The parameter `total_gpu_memory` is the free memory at init time and must NOT
+    # be used as the denominator for the (1 - utilization) reservation — doing so
+    # under-estimates the reservation when the model uses significant memory.
+    from tokenspeed.runtime.utils.common import get_device_module as _get_dev
+
+    dev = _get_dev()
+    _, total_mem_bytes = dev.mem_get_info(gpu_id)
+    total_memory_gib = total_mem_bytes / (1 << 30)
+
+    # Reserve (1 - gpu_memory_utilization) of total physical memory for
+    # non-KV-cache overhead (framework, activations, etc.).  The remainder
+    # (capped by current free memory) is available for the KV cache.
+    cache_memory = available_gpu_memory - total_memory_gib * (
         1 - gpu_memory_utilization
     )
+    if cache_memory < 0:
+        # Fallback: when the model weights consume more than
+        # total * utilization of memory, reserve a fraction of the
+        # *remaining* free memory instead of failing completely.
+        logger.warning(
+            "Available memory %.2f GiB is insufficient for the standard "
+            "KV cache reservation (need %.2f GiB for non-cache use at "
+            "utilization=%.2f). Falling back to using %.0f%% of remaining "
+            "memory. Consider increasing --gpu-memory-utilization.",
+            available_gpu_memory,
+            total_memory_gib * (1 - gpu_memory_utilization),
+            gpu_memory_utilization,
+            gpu_memory_utilization * 100,
+        )
+        cache_memory = available_gpu_memory * gpu_memory_utilization
+        if cache_memory <= 0:
+            logger.error(
+                "No memory available for KV cache even with fallback. "
+                "Available=%.2f GiB, utilization=%.2f",
+                available_gpu_memory,
+                gpu_memory_utilization,
+            )
+            cache_memory = 0.0
     return int(cache_memory * (1 << 30))
 
 

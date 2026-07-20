@@ -552,7 +552,11 @@ def create_attn_components(
         max_num_tokens = int(_CI_SMALL_KV_SIZE)
     if max_num_tokens <= 0:
         raise ValueError(
-            f"KV cache token pool size must be positive, got {max_num_tokens}"
+            f"KV cache token pool size must be positive, got {max_num_tokens}. "
+            f"This typically means the GPU memory is insufficient for the model "
+            f"with gpu_memory_utilization={server_args.gpu_memory_utilization}. "
+            f"Try increasing --gpu-memory-utilization (e.g., 0.9), reducing "
+            f"--max-model-len, or using --tensor-parallel-size > 1."
         )
 
     if is_deepseek_v4_model:
