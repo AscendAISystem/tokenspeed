@@ -579,6 +579,31 @@ async def run_smg(
                     pass
 
 
+def _gateway_args_with_default_tokenizer_path(gateway_args: list[str]) -> list[str]:
+    """Ensure ``--tokenizer-path`` is forwarded to the SMG gateway.
+
+    The SMG Rust gateway needs ``--tokenizer-path`` to load the tokenizer
+    from the local filesystem at worker registration time; without it the
+    gateway has no way to obtain the tokenizer (TokenSpeed doesn't expose a
+    ``GetTokenizer`` gRPC RPC) and returns ``tokenizer_not_found`` on the
+    first request.
+
+    When the user has not explicitly set ``--tokenizer-path`` we derive it
+    from ``--model`` / ``--model-path`` (the tokenizer typically lives
+    alongside the model weights).
+    """
+    # Extract the model value
+    model_id = _user_model_id(gateway_args)
+    if model_id is None:
+        return gateway_args
+
+    # If --tokenizer-path is already present, respect the user's choice.
+    if "--tokenizer-path" in gateway_args:
+        return gateway_args
+
+    return [*gateway_args, "--tokenizer-path", model_id]
+
+
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
     try:
@@ -596,6 +621,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
         split.engine, split.gateway
     )
     gateway_args = _gateway_args_with_defaults(gateway_args)
+    gateway_args = _gateway_args_with_default_tokenizer_path(gateway_args)
     user_host, user_port = _user_host_port_from_gateway_args(gateway_args)
 
     model_id = _user_model_id(gateway_args)
