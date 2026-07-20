@@ -52,6 +52,45 @@ from tokenspeed_kernel.signature import format_signatures
 
 _decode_attn_capture_handles: list[dict] = []
 
+# ---------------------------------------------------------------------------
+# Causal mask for sparse_mode=3 (CANN V3 requires explicit atten_mask)
+# ---------------------------------------------------------------------------
+# Pre-built 2048×2048 causal mask for sparse_mode=3 (rightDownCausal).
+# CANN V3 requires an explicit atten_mask (bool/uint8) when sparse_mode != 0.
+# Shape: (2048, 2048), value: True = masked out, False = allowed.
+# Lower triangle + diagonal = False (allowed), upper triangle = True (masked).
+# Created once per device and cached lazily.
+_MAX_ATTEN_SIZE = 2048
+_causal_mask_2048: dict[str, torch.Tensor] = {}
+
+
+def _get_causal_mask(device: torch.device) -> torch.Tensor:
+    """Return a 2048×2048 causal bool mask suitable for ``sparse_mode=3``.
+
+    CANN ``sparse_mode=3`` (rightDownCausal) requires an explicit
+    ``atten_mask`` even in TND layout on CANN 2.10.0 (V3 API).
+    The mask must be bool or uint8 — float dtypes (bf16/fp16) are rejected.
+
+    The returned mask has shape ``(2048, 2048)`` where ``True`` means
+    masked out (upper triangle, j > i) and ``False`` means allowed
+    (lower triangle including diagonal, j ≤ i).
+
+    Created once per device and cached in ``_causal_mask_2048``.
+    """
+    global _causal_mask_2048
+    key = device.type  # cache per device type (e.g. "npu")
+    if key not in _causal_mask_2048:
+        mask = torch.ones(
+            (_MAX_ATTEN_SIZE, _MAX_ATTEN_SIZE),
+            dtype=torch.bool,
+            device=device,
+        )
+        # Upper triangle (j > i) stays True (masked);
+        # lower triangle + diagonal become False (allowed)
+        mask = torch.triu(mask, diagonal=1)
+        _causal_mask_2048[key] = mask
+    return _causal_mask_2048[key]
+
 
 def get_decode_attn_capture_handles() -> list[dict]:
     """Return all stored capture handles for decode attention and clear list.
@@ -172,18 +211,18 @@ def npu_mha_prefill(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """MHA prefill using per-batch PyTorch SDPA with causal masking.
+    """MHA prefill using TND layout + ``npu_fused_infer_attention_score``.
 
-    Uses per-batch ``scaled_dot_product_attention`` with ``is_causal=True``
-    for correct block-diagonal autoregressive masking in packed sequences.
+    Uses CANN's fused attention kernel with TND (Tile-Nested-Descriptor)
+    layout for efficient block-diagonal causal masking in packed sequences,
+    with graceful fallback to per-batch PyTorch SDPA when the fused kernel
+    is unavailable.
 
     .. note::
 
-       CANN's ``npu_fused_infer_attention_score`` with TND layout
-       and ``sparse_mode=3`` does **not** apply proper causal masking
-       on CANN 2.10.0 (the output is identical to ``sparse_mode=0``).
-       The forward-looking TND+fused path is coded but gated behind a
-       version check for future CANN releases that fix this behaviour.
+       The fused kernel natively handles GQA via separate ``num_heads``
+       and ``num_key_value_heads`` parameters, so no manual KV head
+       repetition is needed in the fused path.
 
     Args:
         q: Query tensor shaped ``[total_q, num_q_heads, head_dim]``.
@@ -213,38 +252,83 @@ def npu_mha_prefill(
     total_q = q.shape[0]
     total_kv = k.shape[0]
 
-    # ---- SDPA per-batch fallback (correct causal masking) ----
-    # NOTE(cann-tnd): CANN 2.10.0 TND+sparse_mode=3 does NOT apply proper
-    # causal masking in the fused attention kernel. We fall back to per-batch
-    # SDPA with is_causal=True for correct block-diagonal causal masking.
-    logger.debug("npu_mha_prefill: using per-batch SDPA fallback (causal masking)")
+    # ---- TND layout + fused attention path (when available) ----
+    if fused_attn is not None:
+        # TND layout: [total_seq, num_heads, head_dim] (no batch dim)
+        q_tnd = q  # [total_q, num_q_heads, head_dim] — already TND shape
+        k_tnd = k  # [total_kv, num_kv_heads, head_dim]
+        v_tnd = v
 
-    act_seq = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
-    batch_size = len(act_seq) - 1
+        # cu_seqlens must be Python list[int] for actual_seq_lengths
+        act_seq = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
 
-    n_reps = num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else 1
-    if n_reps > 1:
-        k = k.repeat_interleave(n_reps, dim=1)
-        v = v.repeat_interleave(n_reps, dim=1)
+        if window_left > 0:
+            # Sliding window: sparse_mode=4 + pre_tokens
+            sparse_mode = 4
+            causal_tokens = window_left
+            logger.debug("npu_mha_prefill: using TND fused attention sparse_mode=4 (sliding window, pre_tokens=%s)", causal_tokens)
+        else:
+            # Standard causal: sparse_mode=3 requires explicit atten_mask (CANN V3 API)
+            sparse_mode = 3
+            causal_tokens = None
+            atten_mask = _get_causal_mask(q.device)
+            logger.debug("npu_mha_prefill: using TND fused attention sparse_mode=3 (causal with 2048x2048 bool atten_mask)")
 
-    outputs = []
-    for i in range(batch_size):
-        start = act_seq[i]
-        end = act_seq[i + 1]
-        q_i = q[start:end].unsqueeze(0).transpose(1, 2)   # [1, H, sl, D]
-        k_i = k[start:end].unsqueeze(0).transpose(1, 2)
-        v_i = v[start:end].unsqueeze(0).transpose(1, 2)
-        out_i = torch.nn.functional.scaled_dot_product_attention(
-            q_i, k_i, v_i,
+        kwargs = dict(
+            num_heads=num_q_heads,
+            num_key_value_heads=num_kv_heads,
             scale=scale,
-            is_causal=True,
-        ).transpose(1, 2).squeeze(0)  # [sl, H, D]
-        outputs.append(out_i)
+            input_layout="TND",
+            actual_seq_lengths=act_seq,
+            actual_seq_lengths_kv=act_seq,
+            sparse_mode=sparse_mode,
+            softmax_lse_flag=return_lse,
+        )
+        if sparse_mode == 4:
+            kwargs["pre_tokens"] = causal_tokens
+            kwargs["next_tokens"] = 0
+        elif sparse_mode == 3:
+            kwargs["atten_mask"] = atten_mask
 
-    out = torch.cat(outputs, dim=0)
+        out, lse_tmp = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
+        # fused output: [total_q, num_q_heads, head_dim] — already correct shape
+    else:
+        # ---- SDPA per-batch fallback (correct causal masking) ----
+        logger.debug("npu_mha_prefill: using per-batch SDPA fallback (causal masking)")
+
+        act_seq = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        batch_size = len(act_seq) - 1
+
+        k_sdpa = k
+        v_sdpa = v
+        if num_q_heads != num_kv_heads:
+            n_reps = num_q_heads // num_kv_heads
+            k_sdpa = k.repeat_interleave(n_reps, dim=1)
+            v_sdpa = v.repeat_interleave(n_reps, dim=1)
+
+        outputs = []
+        for i in range(batch_size):
+            start = act_seq[i]
+            end = act_seq[i + 1]
+            q_i = q[start:end].unsqueeze(0).transpose(1, 2)   # [1, H, sl, D]
+            k_i = k_sdpa[start:end].unsqueeze(0).transpose(1, 2)
+            v_i = v_sdpa[start:end].unsqueeze(0).transpose(1, 2)
+            out_i = torch.nn.functional.scaled_dot_product_attention(
+                q_i, k_i, v_i,
+                scale=scale,
+                is_causal=True,
+            ).transpose(1, 2).squeeze(0)  # [sl, H, D]
+            outputs.append(out_i)
+
+        out = torch.cat(outputs, dim=0)
 
     if return_lse:
-        lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
+        if fused_attn is not None:
+            # fused path: lse_tmp shape is [total_q, num_q_heads, 1]; squeeze to [total_q, num_q_heads]
+            lse = lse_tmp.squeeze(-1)
+        else:
+            # fallback SDPA path: dummy lse
+            lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
         return out, lse
     return out
 
