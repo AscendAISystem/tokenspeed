@@ -726,12 +726,11 @@ def npu_mha_decode_with_kvcache(
                     running += max_seqlen_q
                     cum_seq_q.append(running)
 
-                # Build cumulative KV lengths from cache_seqlens
-                cum_seq_kv = []
-                running = 0
-                for i in range(batch_size):
-                    running += int(cache_seqlens[i])
-                    cum_seq_kv.append(running)
+                # Build KV lengths from cache_seqlens (per-sequence, not cumulative —
+                # CANN's TND page attention expects per-sequence lengths for
+                # actual_seq_lengths_kv, and each must fit within
+                # KV_S = block_size * max_pages_per_seq)
+                cum_seq_kv = [int(cache_seqlens[i]) for i in range(batch_size)]
 
                 # Sparse mode
                 if window_left > 0:
@@ -766,6 +765,10 @@ def npu_mha_decode_with_kvcache(
                 out, _ = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
                 # TND output is [total_q, num_q_heads, head_dim] — already correct
                 use_fused = True
+                logger.debug(
+                    "npu_mha_decode_with_kvcache: using TND fused attention "
+                    "(sparse_mode=%s)", sparse_mode
+                )
             except RuntimeError as e:
                 logger.warning(
                     "NPU fused attention failed, falling back to SDPA: %s", e
