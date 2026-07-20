@@ -209,13 +209,16 @@ def _expert_compute(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Compute per-expert matmuls with SwiGLU activation.
+    """Compute per-expert matmuls with SwiGLU activation using npu_grouped_matmul.
 
-    M01 decomposed FP8 path:
-      gate = matmul(hidden, gate_weight.T)
-      up   = matmul(hidden, up_weight.T)
-      act  = swiglu(gate, up)
-      out  = matmul(act, down_weight.T)
+    M01 decomposed FP8 path, optimized with ``npu_grouped_matmul``:
+      grouped_matmul([expert_tokens_i], [gate_w_i.T])   -> gate_i
+      grouped_matmul([expert_tokens_i], [up_w_i.T])     -> up_i
+      swiglu(gate_i, up_i)                               -> act_i
+      grouped_matmul([act_i], [down_w_i.T])              -> out_i
+
+    Scatter-add with routing weights stays per-expert (``index_add_`` cannot
+    be grouped).
 
     Args:
         dispatched_hidden: ``[total_dispatched, hidden_size]``.
@@ -234,14 +237,17 @@ def _expert_compute(
     Returns:
         Output tensor ``[n_tokens, hidden_size]``.
     """
-    # Determine weight dimensions
     is_expert_parallel = w13_weight.dim() == 3  # [E, 2*intermediate, hidden] for w13
-    # w13_weight shape: [num_experts, 2 * intermediate_size, hidden_size]
-    # w2_weight shape:  [num_experts, hidden_size, intermediate_size]
     total_inter = w13_weight.shape[1] if is_expert_parallel else w13_weight.shape[0]
     half_inter = total_inter // 2
 
-    output_buffer = torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
+    # Collect per-expert tokens and weights (pre-transposed for grouped_matmul)
+    expert_token_list = []
+    gate_w_list = []   # each: [hidden_size, intermediate] pre-transposed
+    up_w_list = []     # each: [hidden_size, intermediate] pre-transposed
+    down_w_list = []   # each: [intermediate, hidden] pre-transposed
+    expert_ranges = []
+    valid_experts = []
 
     for expert_id in range(num_experts):
         start = expert_offsets[expert_id].item()
@@ -249,34 +255,56 @@ def _expert_compute(
         if start >= end:
             continue
 
-        expert_tokens = dispatched_hidden[start:end]  # [N, hidden_size]
+        expert_tokens = dispatched_hidden[start:end]
+        expert_token_list.append(expert_tokens)
 
         if is_expert_parallel:
             # w13_weight[expert_id]: [2*intermediate, hidden]
-            gate_w = w13_weight[expert_id, :half_inter, :]  # [intermediate, hidden]
-            up_w = w13_weight[expert_id, half_inter:, :]    # [intermediate, hidden]
-            down_w = w2_weight[expert_id] if w2_weight.dim() == 3 else w2_weight  # [hidden, intermediate]
+            gate_w = w13_weight[expert_id, :half_inter, :].T   # [hidden, intermediate]
+            up_w = w13_weight[expert_id, half_inter:, :].T     # [hidden, intermediate]
+            down_w = (w2_weight[expert_id] if w2_weight.dim() == 3 else w2_weight).T  # [intermediate, hidden]
         else:
-            gate_w = w13_weight[:half_inter, :]  # [intermediate, hidden]
-            up_w = w13_weight[half_inter:, :]    # [intermediate, hidden]
-            down_w = w2_weight                   # [hidden, intermediate]
+            gate_w = w13_weight[:half_inter, :].T   # [hidden, intermediate]
+            up_w = w13_weight[half_inter:, :].T     # [hidden, intermediate]
+            down_w = w2_weight.T                    # [intermediate, hidden]
 
-        # Step 1-2: Gate and Up projections
-        gate_out = torch.matmul(expert_tokens, gate_w.T)  # [N, hidden] @ [hidden, intermediate] -> [N, intermediate]
-        up_out = torch.matmul(expert_tokens, up_w.T)      # [N, hidden] @ [hidden, intermediate] -> [N, intermediate]
+        gate_w_list.append(gate_w.contiguous())
+        up_w_list.append(up_w.contiguous())
+        down_w_list.append(down_w.contiguous())
+        expert_ranges.append((start, end))
+        valid_experts.append(expert_id)
 
-        # Step 3: SwiGLU activation
-        act_out = _npu_swiglu(gate_out, up_out)           # [N, intermediate]
+    if not expert_token_list:
+        return torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
 
-        # Step 4: Down projection
-        expert_out = torch.matmul(act_out, down_w.T)      # [N, intermediate] @ [intermediate, hidden] -> [N, hidden]
+    # Grouped matmul: all experts' gate and up projections in parallel
+    # Use torch.ops.npu.npu_grouped_matmul.List for per-expert output lists
+    gate_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        expert_token_list, gate_w_list, split_item=0, group_type=0
+    )
+    up_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        expert_token_list, up_w_list, split_item=0, group_type=0
+    )
 
-        # Scale by routing weight and scatter back
+    # SwiGLU activation (elementwise, per-expert)
+    act_out_list = [
+        _npu_swiglu(g, u) for g, u in zip(gate_out_list, up_out_list)
+    ]
+
+    # Grouped matmul: all experts' down projections
+    expert_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        act_out_list, down_w_list, split_item=0, group_type=0
+    )
+
+    # Weighted scatter-add to output buffer (index_add_ cannot be grouped)
+    output_buffer = torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
+    for idx, expert_id in enumerate(valid_experts):
+        start, end = expert_ranges[idx]
         weight_scalar = sorted_weights[start:end].unsqueeze(-1)
         token_indices = gather_indices[start:end].long()
         output_buffer.index_add_(
             0, token_indices,
-            expert_out * weight_scalar.to(expert_out.dtype)
+            expert_out_list[idx] * weight_scalar.to(expert_out_list[idx].dtype)
         )
 
     return output_buffer
