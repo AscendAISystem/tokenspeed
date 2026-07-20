@@ -33,6 +33,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -426,6 +428,67 @@ class _WeightCreator:
         return obj
 
 
+# MXFP4 E2M1 → float32 lookup table (index by 4-bit value 0-15).
+_E2M1_LUT = torch.tensor([
+    0.0,   # 0000
+    0.5,   # 0001
+    1.0,   # 0010
+    1.5,   # 0011
+    2.0,   # 0100
+    3.0,   # 0101
+    4.0,   # 0110
+    6.0,   # 0111
+    -0.0,  # 1000
+    -0.5,  # 1001
+    -1.0,  # 1010
+    -1.5,  # 1011
+    -2.0,  # 1100
+    -3.0,  # 1101
+    -4.0,  # 1110
+    -6.0,  # 1111
+], dtype=torch.float32)
+
+
+def _dequantize_mxfp4_blocks(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize MXFP4 packed blocks + E8M0 scales to bfloat16.
+
+    MXFP4 format:
+    - blocks: [..., G, 16] uint8, each byte packs 2 E2M1 4-bit values.
+      32 elements per group (G groups), 16 bytes → 32 4-bit values.
+    - scales: [..., G] uint8, E8M0 format: scale = 2^(x-127).
+
+    Returns:
+        [..., G*32] bfloat16 dequantized values.
+    """
+    # Unpack: each uint8 → low 4 bits, high 4 bits
+    low = (blocks & 0x0F).to(torch.long)          # [..., G, 16]
+    high = ((blocks >> 4) & 0x0F).to(torch.long)  # [..., G, 16]
+
+    # Interleave: [..., G, 16] → [..., G, 32]
+    unpacked = torch.empty(
+        *blocks.shape[:-1], 32,
+        dtype=torch.long, device=blocks.device,
+    )
+    unpacked[..., 0::2] = low
+    unpacked[..., 1::2] = high
+
+    # LUT: E2M1 4-bit → float32
+    fp4_values = _E2M1_LUT.to(blocks.device)[unpacked]  # [..., G, 32]
+
+    # E8M0: 2^(x - 127)
+    scale_values = 2.0 ** (scales.float() - 127.0)  # [..., G]
+
+    # Dequantize: multiply each element by its group scale
+    result = fp4_values * scale_values[..., None]  # [..., G, 32]
+
+    # Reshape: [..., G, 32] → [..., H] where H = G * 32
+    *prefix, G32, _ = result.shape
+    return result.reshape(*prefix, G32 * 32).to(torch.bfloat16)
+
+
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
 
@@ -597,10 +660,185 @@ class GptOssForCausalLM(BaseCausalLM):
         if is_nextn:
             raise ValueError("GPT-OSS does not support nextn weight loading.")
 
-        if quant_config_name == "mxfp4":
-            self._load_mxfp4_weights(weights, weight_name_mapping=weight_name_mapping)
+        # On NPU, quant_config may be None for MXFP4 models (since NPU kernel
+        # lacks MXFP4 support). Detect MXFP4 checkpoint by looking for packed
+        # block weights and dequantize to bfloat16 during loading.
+        # NOTE: must check from config, not by scanning weights (doing so would
+        # consume the weights generator and lose the first few tensors).
+        _is_mxfp4_ckpt = (
+            getattr(self.config, "quantization_config", None) or {}
+        ).get("quant_method", "") == "mxfp4"
+        is_mxfp4_checkpoint = (
+            quant_config_name is None
+            and current_platform().is_npu
+            and _is_mxfp4_ckpt
+        )
+
+        if quant_config_name == "mxfp4" or is_mxfp4_checkpoint:
+            if is_mxfp4_checkpoint:
+                self._load_mxfp4_weights_dequantized(
+                    weights, weight_name_mapping=weight_name_mapping
+                )
+            else:
+                self._load_mxfp4_weights(
+                    weights, weight_name_mapping=weight_name_mapping
+                )
         else:
             self._load_normal_weights(weights, weight_name_mapping=weight_name_mapping)
+
+    def _load_mxfp4_weights_dequantized(
+        self,
+        weights,
+        weight_name_mapping: dict = None,
+    ):
+        """Load MXFP4 checkpoint, dequantizing blocks+scales to bfloat16 (NPU path).
+
+        MXFP4 weights are stored as uint8 packed blocks + E8M0 scales.
+        On NPU, the MoE kernel does not support MXFP4 natively, so we
+        dequantize to bfloat16 during loading and use the unquant path.
+        """
+        mxfp4_weights = []
+        normal_weights = []
+
+        for name, weight in weights:
+            if ".experts" in name:
+                mxfp4_weights.append((name, weight))
+            else:
+                normal_weights.append((name, weight))
+
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights_dequantized(
+            mxfp4_weights
+        )
+
+        # DEBUG
+        layer_names_in_normal = set()
+        for n, _ in normal_weights:
+            for i, p in enumerate(n.split('.')):
+                if p == 'layers' and i+1 < len(n.split('.')):
+                    layer_names_in_normal.add(int(n.split('.')[i+1]))
+                    break
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info("DEBUG normal_weights has layers: %s", sorted(layer_names_in_normal))
+            logger.info("DEBUG normal_weights count: %d", len(normal_weights))
+            logger.info("DEBUG mxfp4_loaded_params (sample 5): %s", sorted(mxfp4_loaded_params)[:5])
+
+        self._load_normal_weights(
+            normal_weights,
+            weight_name_mapping=weight_name_mapping,
+            other_loaded_param_names=mxfp4_loaded_params,
+        )
+
+    def _load_mxfp4_experts_weights_dequantized(self, weights):
+        """Dequantize MXFP4 blocks+scales to bfloat16 and load into unquant params."""
+        params_dict = dict(self.named_parameters())
+        loaded_params: set = set()
+        mxfp4_block = 32
+
+        moe_tp_rank = self.mapping.moe.tp_rank
+        moe_tp_size = self.mapping.moe.tp_size
+        moe_ep_rank = self.mapping.moe.ep_rank
+        moe_ep_size = self.mapping.moe.ep_size
+
+        intermediate_size = self.config.intermediate_size
+        intermediate_size_block = intermediate_size // mxfp4_block
+        per_rank_intermediate_size_block = math.ceil(
+            intermediate_size_block / moe_tp_size
+        )
+        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+        moe_num_global_experts = self.config.num_local_experts
+        moe_num_local_experts = moe_num_global_experts // moe_ep_size
+
+        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+        moe_tp_rank_end = min(
+            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+        )
+
+        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
+
+        def _copy_into_param(param, narrow_weight):
+            if param.shape == narrow_weight.shape:
+                param.data.copy_(narrow_weight)
+            else:
+                slices = tuple(
+                    slice(0, min(p, n))
+                    for p, n in zip(param.shape, narrow_weight.shape)
+                )
+                param.data[slices].copy_(narrow_weight[slices])
+
+        # Buffer blocks, scales, and bias tensors for dequantization.
+        # NOTE: weights is a generator that can only be iterated once, so we
+        # must collect everything in a single pass.
+        buf_blocks: dict[str, torch.Tensor] = {}
+        buf_scales: dict[str, torch.Tensor] = {}
+        buf_bias: dict[str, torch.Tensor] = {}
+
+        for name, weight in weights:
+            weight = _WeightCreator.maybe_materialize(weight)
+            if "_blocks" in name:
+                buf_blocks[name] = weight
+            elif "_scales" in name:
+                buf_scales[name] = weight
+            elif "_bias" in name:
+                buf_bias[name] = weight
+
+        num_blocks = len(buf_blocks)
+        for idx, (name, blocks) in enumerate(buf_blocks.items()):
+            scales = buf_scales.get(name.replace("_blocks", "_scales"))
+
+            if scales is None:
+                logger.warning("No scales for %s, skipping dequant", name)
+                continue
+
+            if idx % 20 == 0:
+                logger.info("Dequantizing MXFP4 weights [%d/%d]: %s", idx + 1, num_blocks, name)
+
+            if "gate_up_proj" in name:
+                # Map checkpoint name to model param name
+                new_name = name.replace("gate_up_proj_blocks", "w13_weight")
+                dq = _dequantize_mxfp4_blocks(blocks, scales)
+                narrow_weight = dq[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
+                    :,
+                ]
+                _copy_into_param(params_dict[new_name], narrow_weight)
+                loaded_params.add(new_name)
+
+            elif "down_proj" in name:
+                new_name = name.replace("down_proj_blocks", "w2_weight")
+                dq = _dequantize_mxfp4_blocks(blocks, scales)
+                narrow_weight = dq[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    :,
+                    moe_tp_rank_start: moe_tp_rank_end,
+                ]
+                _copy_into_param(params_dict[new_name], narrow_weight)
+                loaded_params.add(new_name)
+
+        # Process bias weights (no dequant needed, they're bfloat16)
+        for name, weight in buf_bias.items():
+            if "gate_up_proj" in name:
+                new_name = name.replace("gate_up_proj_bias", "w13_weight_bias")
+                narrow_weight = weight[
+                    moe_ep_rank_start:moe_ep_rank_end,
+                    2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
+                ]
+                _copy_into_param(params_dict[new_name], narrow_weight)
+                loaded_params.add(new_name)
+            elif "down_proj" in name:
+                new_name = name.replace("down_proj_bias", "w2_weight_bias")
+                narrow_weight = weight[moe_ep_rank_start:moe_ep_rank_end, ...]
+                if moe_tp_rank != 0:
+                    narrow_weight = torch.zeros_like(narrow_weight)
+                _copy_into_param(params_dict[new_name], narrow_weight)
+                loaded_params.add(new_name)
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info("Dequantized %d MXFP4 weight blocks into %d params", num_blocks, len(loaded_params))
+
+        return loaded_params
 
     def _load_normal_weights(
         self,
@@ -648,6 +886,14 @@ class GptOssForCausalLM(BaseCausalLM):
             transpose_local_tensor_non_bias=True,
         )
         params_checker = {k: False for k in params_dict}
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info("DEBUG _load_normal_weights processing %d weights", len(weights))
+            # Show first and last 5
+            for n, _ in weights[:5]:
+                logger.info("DEBUG _load_normal_weights first: %s", n)
+            for n, _ in weights[-5:]:
+                logger.info("DEBUG _load_normal_weights last: %s", n)
 
         for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
@@ -700,6 +946,8 @@ class GptOssForCausalLM(BaseCausalLM):
 
         not_loaded_params = []
         already_loaded = other_loaded_param_names or set()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info("DEBUG already_loaded count: %d, sample: %s", len(already_loaded), list(already_loaded)[:5] if already_loaded else "empty")
         for k, v in params_checker.items():
             if (
                 not v
@@ -707,6 +955,10 @@ class GptOssForCausalLM(BaseCausalLM):
                 and ("input_scale" not in k)
                 and k not in already_loaded
             ):
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    # Log unloaded params from layers 7-9 for debugging
+                    if any(f"layers.{layer}" in k for layer in [6, 7, 8, 9]) or 'embed' in k or 'norm' in k or 'lm_head' in k:
+                        logger.info("DEBUG not loaded: %s (v=%s, in_already_loaded=%s)", k, v, k in already_loaded)
                 not_loaded_params.append(k)
 
         if rank == 0:

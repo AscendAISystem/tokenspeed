@@ -117,6 +117,16 @@ def _get_quantization_config(
     if model_config.quantization is not None:
         quant_config = get_quant_config(model_config, load_config)
         platform = current_platform()
+
+        # NPU (Huawei Ascend) does not have CUDA-style compute capability.
+        # Skip the quantization capability check on NPU. Additionally,
+        # return None for MXFP4 quantization since the NPU MoE kernel
+        # does not support MXFP4; weights will be dequantized during loading.
+        if platform.is_huawei:
+            if quant_config.get_min_capability() > 0:
+                return None
+            return quant_config
+
         capability = platform.arch_version.major * 10 + platform.arch_version.minor
         if capability < quant_config.get_min_capability():
             raise ValueError(

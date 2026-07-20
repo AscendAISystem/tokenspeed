@@ -67,8 +67,10 @@ class WeightLoader:
             get_available_gpu_memory(device, gpu_id),
         )
 
-        # Reduce thread conflicts during weight loading
-        if device != "cpu":
+        # Reduce thread conflicts during weight loading.
+        # On CUDA this is safe (GPU does the work). On NPU, weight dequantization
+        # (e.g. MXFP4) runs on CPU, so keep default threads for performance.
+        if device != "cpu" and device != "npu":
             torch.set_num_threads(1)
 
         set_cuda_arch()

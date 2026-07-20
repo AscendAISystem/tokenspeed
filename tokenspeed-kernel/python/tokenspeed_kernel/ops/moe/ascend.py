@@ -208,6 +208,8 @@ def _expert_compute(
     num_experts: int,
     dtype: torch.dtype,
     device: torch.device,
+    w13_weight_bias: torch.Tensor | None = None,
+    w2_weight_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute per-expert matmuls with SwiGLU activation using npu_grouped_matmul.
 
@@ -218,7 +220,7 @@ def _expert_compute(
       grouped_matmul([act_i], [down_w_i.T])              -> out_i
 
     Scatter-add with routing weights stays per-expert (``index_add_`` cannot
-    be grouped).
+    be grouped). Optional per-expert bias is added to gate, up, and down outputs.
 
     Args:
         dispatched_hidden: ``[total_dispatched, hidden_size]``.
@@ -233,6 +235,8 @@ def _expert_compute(
         num_experts: Number of experts.
         dtype: Working dtype.
         device: Computing device.
+        w13_weight_bias: Optional ``[num_experts, K]`` bias for fused gate+up.
+        w2_weight_bias: Optional ``[num_experts, H]`` bias for down projection.
 
     Returns:
         Output tensor ``[n_tokens, hidden_size]``.
@@ -241,11 +245,18 @@ def _expert_compute(
     total_inter = w13_weight.shape[1] if is_expert_parallel else w13_weight.shape[0]
     half_inter = total_inter // 2
 
+    has_bias = w13_weight_bias is not None
+    if has_bias:
+        has_bias_ep = w13_weight_bias.dim() == 2  # [E, K]
+
     # Collect per-expert tokens and weights (pre-transposed for grouped_matmul)
     expert_token_list = []
     gate_w_list = []   # each: [hidden_size, intermediate] pre-transposed
     up_w_list = []     # each: [hidden_size, intermediate] pre-transposed
     down_w_list = []   # each: [intermediate, hidden] pre-transposed
+    gate_bias_list = []  # each: [intermediate] if has_bias
+    up_bias_list = []    # each: [intermediate] if has_bias
+    down_bias_list = []  # each: [hidden] if has_bias
     expert_ranges = []
     valid_experts = []
 
@@ -263,10 +274,25 @@ def _expert_compute(
             gate_w = w13_weight[expert_id, :half_inter, :].T   # [hidden, intermediate]
             up_w = w13_weight[expert_id, half_inter:, :].T     # [hidden, intermediate]
             down_w = (w2_weight[expert_id] if w2_weight.dim() == 3 else w2_weight).T  # [intermediate, hidden]
+            if has_bias and has_bias_ep:
+                gate_bias_list.append(w13_weight_bias[expert_id, :half_inter])
+                up_bias_list.append(w13_weight_bias[expert_id, half_inter:])
+                down_bias_list.append(
+                    w2_weight_bias[expert_id] if w2_weight_bias is not None and w2_weight_bias.dim() == 2
+                    else None
+                )
+            elif has_bias:
+                gate_bias_list.append(w13_weight_bias[:half_inter])
+                up_bias_list.append(w13_weight_bias[half_inter:])
+                down_bias_list.append(w2_weight_bias if w2_weight_bias is not None else None)
         else:
             gate_w = w13_weight[:half_inter, :].T   # [hidden, intermediate]
             up_w = w13_weight[half_inter:, :].T     # [hidden, intermediate]
             down_w = w2_weight.T                    # [intermediate, hidden]
+            if has_bias:
+                gate_bias_list.append(w13_weight_bias[:half_inter] if w13_weight_bias is not None else None)
+                up_bias_list.append(w13_weight_bias[half_inter:] if w13_weight_bias is not None else None)
+                down_bias_list.append(w2_weight_bias if w2_weight_bias is not None else None)
 
         gate_w_list.append(gate_w.contiguous())
         up_w_list.append(up_w.contiguous())
@@ -278,13 +304,23 @@ def _expert_compute(
         return torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
 
     # Grouped matmul: all experts' gate and up projections in parallel
-    # Use torch.ops.npu.npu_grouped_matmul.List for per-expert output lists
     gate_out_list = torch.ops.npu.npu_grouped_matmul.List(
         expert_token_list, gate_w_list, split_item=0, group_type=0
     )
     up_out_list = torch.ops.npu.npu_grouped_matmul.List(
         expert_token_list, up_w_list, split_item=0, group_type=0
     )
+
+    # Add bias to gate and up outputs if available
+    if has_bias:
+        gate_out_list = [
+            g + b.unsqueeze(0) if b is not None else g
+            for g, b in zip(gate_out_list, gate_bias_list)
+        ]
+        up_out_list = [
+            u + b.unsqueeze(0) if b is not None else u
+            for u, b in zip(up_out_list, up_bias_list)
+        ]
 
     # SwiGLU activation (elementwise, per-expert)
     act_out_list = [
@@ -296,7 +332,14 @@ def _expert_compute(
         act_out_list, down_w_list, split_item=0, group_type=0
     )
 
-    # Weighted scatter-add to output buffer (index_add_ cannot be grouped)
+    # Add down bias if available
+    if has_bias and any(b is not None for b in down_bias_list):
+        expert_out_list = [
+            o + b.unsqueeze(0) if b is not None else o
+            for o, b in zip(expert_out_list, down_bias_list)
+        ]
+
+    # Weighted scatter-add to output buffer
     output_buffer = torch.zeros(n_tokens, hidden_size, dtype=dtype, device=device)
     for idx, expert_id in enumerate(valid_experts):
         start, end = expert_ranges[idx]
@@ -337,7 +380,7 @@ def _expert_compute(
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"input"}),
         "fp8_scale_block_shape": frozenset({(128, 128)}),
-        "supports_bias": frozenset({False}),
+        "supports_bias": frozenset({True, False}),
     },
     priority=Priority.PORTABLE,
 )
@@ -408,6 +451,10 @@ def npu_ascend_moe_apply(
     if w13_weight is None or w2_weight is None:
         raise RuntimeError("MoE weights not found on module")
 
+    # Read optional per-expert bias tensors
+    w13_weight_bias = getattr(w, "w13_weight_bias", None)
+    w2_weight_bias = getattr(w, "w2_weight_bias", None)
+
     output = _expert_compute(
         dispatched_hidden=dispatched_hidden,
         sorted_weights=sorted_weights,
@@ -421,6 +468,8 @@ def npu_ascend_moe_apply(
         num_experts=num_experts,
         dtype=x.dtype,
         device=x.device,
+        w13_weight_bias=w13_weight_bias,
+        w2_weight_bias=w2_weight_bias,
     )
 
     return output
