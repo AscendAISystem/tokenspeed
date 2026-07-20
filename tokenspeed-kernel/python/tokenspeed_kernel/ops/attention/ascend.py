@@ -97,13 +97,18 @@ def get_decode_attn_capture_handles() -> list[dict]:
 
     Called by ``cuda_graph_wrapper`` after each graph capture session.
     Each dict contains:
-        handle      – opaque handle from ``graph_task_group_end``
-        q/k/v       – tensor references (views of persistent buffers)
+        handle            – opaque handle from ``graph_task_group_end``
+        q/k/v             – tensor references in TND layout
         num_heads,
-        num_kv_heads,
+        num_key_value_heads,
         scale,
-        block_size  – static parameters from capture
-        block_table – page_table tensor reference (contents updated in-place)
+        block_size        – static parameters from capture
+        block_table       – page_table tensor reference
+        sparse_mode       – sparsity mode (3=causal, 4=sliding window)
+        pre_tokens        – left sliding window size (sparse_mode=4 only)
+        next_tokens       – right window (always 0 for decode)
+        atten_mask        – bool mask for sparse_mode != 0
+        max_seqlen_q      – query tokens per batch (usually 1)
     """
     handles = _decode_attn_capture_handles[:]
     _decode_attn_capture_handles.clear()
@@ -119,10 +124,15 @@ def update_decode_attn_graph_params(
 
     Must be called on the capture stream **before** ``graph.replay()``.
 
+    TND layout: the function converts the per-batch KV lengths from
+    ``seq_lens_list`` into cumulative sums needed by ``input_layout="TND"``.
+    Query cumulative lengths are derived from ``max_seqlen_q`` stored in each
+    handle entry.
+
     Args:
         handles: List of handle dicts from ``get_decode_attn_capture_handles()``.
-        seq_lens_list: Current per-batch sequence lengths as Python ``list[int]``.
-                       These replace the capture-time dummy seq_lens.
+        seq_lens_list: Current per-batch KV sequence lengths as Python
+                       ``list[int]``.  Used to build cumulative KV lengths.
         stream: NPU stream for the update.  Defaults to current stream.
     """
     fused_attn = _get_fused_attention_score()
@@ -141,19 +151,43 @@ def update_decode_attn_graph_params(
         )
     for entry in handles:
         handle = entry["handle"]
+        max_sq = entry.get("max_seqlen_q", 1)
+        # Build TND cumulative q lengths from max_seqlen_q
+        cum_q = []
+        running = 0
+        for _ in range(len(seq_lens_list)):
+            running += max_sq
+            cum_q.append(running)
+        # Build TND cumulative KV lengths from per-batch seq_lens_list
+        cum_kv = []
+        running = 0
+        for sl in seq_lens_list:
+            running += sl
+            cum_kv.append(running)
+
         torch.npu.graph_task_update_begin(stream, handle)
+        kwargs = dict(
+            actual_seq_lengths=cum_q,
+            actual_seq_lengths_kv=cum_kv,
+            num_heads=entry["num_heads"],
+            num_key_value_heads=entry["num_key_value_heads"],
+            scale=entry["scale"],
+            input_layout="TND",
+            block_table=entry["block_table"],
+            block_size=entry["block_size"],
+            sparse_mode=entry.get("sparse_mode", 3),
+        )
+        sparse_mode = entry.get("sparse_mode", 3)
+        if sparse_mode == 4:
+            kwargs["pre_tokens"] = entry.get("pre_tokens", 0)
+            kwargs["next_tokens"] = entry.get("next_tokens", 0)
+        if sparse_mode != 0:
+            kwargs["atten_mask"] = entry["atten_mask"]
         fused_attn(
             entry["q"],
             entry["k"],
             entry["v"],
-            actual_seq_lengths=seq_lens_list,
-            actual_seq_lengths_kv=seq_lens_list,
-            num_heads=entry["num_heads"],
-            num_key_value_heads=entry["num_key_value_heads"],
-            scale=entry["scale"],
-            input_layout="BNSD",
-            block_table=entry["block_table"],
-            block_size=entry["block_size"],
+            **kwargs,
         )
         torch.npu.graph_task_update_end(stream)
 
@@ -394,61 +428,93 @@ def npu_mha_extend_with_kvcache(
     Returns:
         Attention output or ``(output, lse)`` when ``return_lse`` is True.
     """
-    del cu_seqlens_kv, max_seqlen_k, logit_cap, sinks  # not used in NPU path
+    del cu_seqlens_kv, max_seqlen_k, logit_cap, sinks
     if not _is_npu_available():
         raise RuntimeError("NPU not available")
 
     fused_attn = _get_fused_attention_score()
     num_q_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[2]
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
+    total_q = q.shape[0]
     batch_size = cache_seqlens.shape[0]
 
-    # Build actual sequence lengths for query
-    seq_lens_q = []
+    # TND: actual_seq_lengths must be cumulative sums without leading zero
+    # (CANN V3 expects length == batch_size, last element == total tokens)
+    cu_q = cu_seqlens_q.tolist() if isinstance(cu_seqlens_q, torch.Tensor) else list(cu_seqlens_q)
+    # Remove leading 0 and keep cumulative: [0, s1, s1+s2] -> [s1, s1+s2]
+    act_seq_q = cu_q[1:]  # length = batch_size, last = total_q
+    # Build KV cumulative lengths from per-batch cache_seqlens
+    kv_cum = []
+    running = 0
     for i in range(batch_size):
-        seq_lens_q.append(int(cu_seqlens_q[i + 1] - cu_seqlens_q[i]))
+        running += int(cache_seqlens[i])
+        kv_cum.append(running)
+    act_seq_kv = kv_cum  # length = batch_size, last = total_kv
 
-    # Build actual sequence lengths for KV
-    seq_lens_kv = [int(s) for s in cache_seqlens]
-
-    # Reshape query: [total_q, heads, dim] -> [1, heads, total_q, dim] (BNSD)
-    q_4d = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, total_q, head_dim]
-
-    # ---- BNSD layout + GQA handling ----
-    # k_cache: [num_pages, page_size, num_kv_heads, head_dim] → transpose to
-    # [num_pages, num_kv_heads, page_size, head_dim] for BNSD page layout
-    k_bnsd = k_cache.transpose(1, 2)
-    v_bnsd = v_cache.transpose(1, 2)
-    num_kv_heads = k_cache.shape[2]
+    # ---- TND layout + fused attention path (when available) ----
     if fused_attn is not None:
-        # Manually repeat KV heads for GQA to avoid CANN non-power-of-2 ratio issue
-        k_fused = k_bnsd
-        v_fused = v_bnsd
-        kv_heads = num_kv_heads
-        if num_q_heads != num_kv_heads:
-            n_reps = num_q_heads // num_kv_heads
-            k_fused = k_bnsd.repeat_interleave(n_reps, dim=1)
-            v_fused = v_bnsd.repeat_interleave(n_reps, dim=1)
-            kv_heads = num_q_heads
-        out, _ = fused_attn(
-            q_4d, k_fused, v_fused,
-            actual_seq_lengths=seq_lens_q,
-            actual_seq_lengths_kv=seq_lens_kv,
+        # TND layout: q is [total_q, num_q_heads, head_dim] — already TND
+        # k_cache/v_cache: original [num_pages, page_size, num_kv_heads, head_dim]
+        # CANN expects [num_pages, num_kv_heads, page_size, head_dim] for TND page attention
+        q_tnd = q  # [total_q, num_q_heads, head_dim]
+        k_tnd = k_cache.transpose(1, 2)  # -> [num_pages, num_kv_heads, page_size, head_dim]
+        v_tnd = v_cache.transpose(1, 2)
+
+        if window_left > 0:
+            sparse_mode = 4
+            # For sparse_mode=4 (sliding window), CANN also requires atten_mask.
+            # Use all-False (no additional masking); shape must be [1, 1, 2048, 2048]
+            atten_mask = torch.zeros(
+                (1, 1, _MAX_ATTEN_SIZE, _MAX_ATTEN_SIZE),
+                dtype=torch.bool,
+                device=q.device,
+            )
+            logger.debug(
+                "npu_mha_extend: using TND fused attention sparse_mode=4 "
+                "(sliding window, pre_tokens=%s)", window_left
+            )
+        elif is_causal:
+            sparse_mode = 3
+            atten_mask = _get_causal_mask(q.device)
+            logger.debug(
+                "npu_mha_extend: using TND fused attention sparse_mode=3 "
+                "(causal, is_causal=True)"
+            )
+        else:
+            sparse_mode = 0
+            atten_mask = None
+            logger.debug(
+                "npu_mha_extend: using TND fused attention sparse_mode=0 "
+                "(non-causal)"
+            )
+
+        kwargs = dict(
             num_heads=num_q_heads,
-            num_key_value_heads=kv_heads,
+            num_key_value_heads=num_kv_heads,
             scale=scale,
-            input_layout="BNSD",
+            input_layout="TND",
+            actual_seq_lengths=act_seq_q,
+            actual_seq_lengths_kv=act_seq_kv,
             block_table=page_table,
             block_size=k_cache.shape[1],
-            sparse_mode=0,
+            sparse_mode=sparse_mode,
+            softmax_lse_flag=return_lse,
         )
-        out = out.squeeze(0)
+        if sparse_mode == 4:
+            kwargs["pre_tokens"] = window_left
+            kwargs["next_tokens"] = 0
+        if sparse_mode != 0:
+            kwargs["atten_mask"] = atten_mask
+
+        out, lse_tmp = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
+        # output: [total_q, num_q_heads, head_dim]
     else:
-        # Fallback: SDPA with cached KV
+        # ---- SDPA fallback ----
+        logger.debug("npu_mha_extend: using SDPA fallback")
         k_contiguous = k_cache.reshape(-1, k_cache.shape[2], k_cache.shape[3])
         v_contiguous = v_cache.reshape(-1, v_cache.shape[2], v_cache.shape[3])
-        # GQA repeat for SDPA fallback
         if num_q_heads != num_kv_heads:
             n_reps = num_q_heads // num_kv_heads
             k_contiguous = k_contiguous.repeat_interleave(n_reps, dim=1)
@@ -462,7 +528,10 @@ def npu_mha_extend_with_kvcache(
         ).transpose(1, 2).squeeze(0)
 
     if return_lse:
-        lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
+        if fused_attn is not None:
+            lse = lse_tmp.squeeze(-1)
+        else:
+            lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
         return out, lse
     return out
 
@@ -503,23 +572,31 @@ def npu_mha_decode_with_kvcache(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor:
-    """MHA decode with paged KV cache using Ascend NPU.
+    """MHA decode with paged KV cache using Ascend NPU (TND layout).
+
+    Uses TND (Tile-Nested-Descriptor) layout for efficient batching of
+    variable-length decode sequences with paged KV cache.
+
+    The kernel natively handles GQA via separate ``num_heads`` and
+    ``num_key_value_heads`` parameters, so no manual KV head repetition
+    is needed.
 
     Args:
-        q: Query tensor shaped ``[batch * max_seqlen_q, num_q_heads, head_dim]``.
+        q: Query tensor shaped ``[total_q, num_q_heads, head_dim]``
+           where ``total_q = batch * max_seqlen_q`` — TND layout.
         k_cache: Paged key cache ``[num_pages, page_size, num_kv_heads, head_dim]``.
         v_cache: Paged value cache (same layout).
         page_table: Page table ``[batch, max_pages_per_seq]``.
         cache_seqlens: Total KV lengths ``[batch]``.
         max_seqlen_k: Maximum KV length.
-        max_seqlen_q: Number of query tokens per request.
-        window_left: Exclusive left sliding-window size.
+        max_seqlen_q: Number of query tokens per request (usually 1 for decode).
+        window_left: Exclusive left sliding-window size.  -1 means full causal.
         logit_cap: Optional soft cap on logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
 
     Returns:
-        Attention output ``[batch * max_seqlen_q, num_q_heads, head_dim]``.
+        Attention output ``[total_q, num_q_heads, head_dim]``.
     """
     del max_seqlen_k, logit_cap, sinks  # not used in NPU path
     if not _is_npu_available():
@@ -527,20 +604,21 @@ def npu_mha_decode_with_kvcache(
 
     fused_attn = _get_fused_attention_score()
     num_q_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[2]
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
     batch_size = q.shape[0] // max_seqlen_q
+    total_q = q.shape[0]  # = batch_size * max_seqlen_q
 
     # Detect CUDA graph capture mode: inside torch.npu.graph(), stream sync is
     # not allowed on Ascend NPU.  We must use only basic tensor ops (matmul,
     # softmax) and avoid any .item() calls that would trigger a CPU sync.
     is_capturing = torch.npu.is_current_stream_capturing()
 
-    # Reshape q for batch processing
-    # q is [batch * max_seqlen_q, num_heads, head_dim]
-    # -> [batch, max_seqlen_q, num_heads, head_dim] (PyTorch BSND layout)
-    q_4d = q.reshape(batch_size, max_seqlen_q, num_q_heads, head_dim)
-
+    # ---- TND layout: q is [total_q, num_q_heads, head_dim] ----
+    # In TND, actual_seq_lengths must be cumulative sums (length=batch_size,
+    # last element=total tokens).  For decode each request has max_seqlen_q
+    # query tokens.
     if is_capturing:
         # ---- Graph-capture path with fused attention + graph_task_group ----
         # Use graph_task_group_begin/end to wrap npu_fused_infer_attention_score
@@ -550,83 +628,151 @@ def npu_mha_decode_with_kvcache(
         #
         # During capture we MUST avoid any .item() / int(tensor) calls because
         # they trigger NPU→CPU sync which is forbidden on a captured stream.
-        # The seq_lens_list here is a DUMMY placeholder; the real values are
-        # passed via update_decode_attn_graph_params() before each replay.
+        # The cumulative seq lengths here are DUMMY placeholders; the real values
+        # are passed via update_decode_attn_graph_params() before each replay.
         logger.info(
             "npu_mha_decode_with_kvcache: graph capture mode, using graph_task_group"
         )
         stream = torch.npu.current_stream()
-        seq_lens_list = [1] * batch_size  # dummy; real values set via graph_task_update
-        # NPU BNSD layout: [batch, num_heads, seqlen, head_dim]
-        q_bnsd = q_4d.transpose(1, 2)  # [B, H_q, Tq, D]
-        k_bnsd = k_cache.transpose(1, 2)  # [num_pages, num_kv_heads, P, D]
-        v_bnsd = v_cache.transpose(1, 2)
-        # Manually repeat KV heads for GQA during capture so the fused kernel
-        # sees num_heads == num_kv_heads (avoids non-power-of-2 ratio issue).
-        num_kv_heads = k_cache.shape[2]
-        torch.npu.graph_task_group_begin(stream)
-        out, _ = fused_attn(
-            q_bnsd, k_bnsd, v_bnsd,
-            actual_seq_lengths=seq_lens_list,
-            actual_seq_lengths_kv=seq_lens_list,
+
+        # TND layout: q is [total_q, num_q_heads, head_dim] — already TND
+        # k_cache/v_cache: transpose [num_pages, page_size, K, D] -> [num_pages, K, page_size, D]
+        q_tnd = q  # [total_q, num_q_heads, head_dim]
+        k_tnd = k_cache.transpose(1, 2)  # [num_pages, num_kv_heads, page_size, head_dim]
+        v_tnd = v_cache.transpose(1, 2)
+
+        # Dummy cumulative q lengths: [max_seqlen_q, 2*max_seqlen_q, ..., total_q]
+        cum_q_dummy = []
+        running = 0
+        for _ in range(batch_size):
+            running += max_seqlen_q
+            cum_q_dummy.append(running)
+
+        # Dummy cumulative KV lengths: [1, 2, ..., batch_size]
+        cum_kv_dummy = []
+        running = 0
+        for _ in range(batch_size):
+            running += 1
+            cum_kv_dummy.append(running)
+
+        # Sparse mode: sliding window (4) or causal (3).
+        # During graph capture, sparse_mode is baked into the captured graph
+        # so it stays constant across replays.
+        sparse_mode = 4 if window_left > 0 else 3
+
+        # Build kwargs for fused attention (TND + page attention)
+        kwargs = dict(
             num_heads=num_q_heads,
-            num_key_value_heads=k_bnsd.shape[1],
+            num_key_value_heads=num_kv_heads,
             scale=scale,
-            input_layout="BNSD",
+            input_layout="TND",
+            actual_seq_lengths=cum_q_dummy,
+            actual_seq_lengths_kv=cum_kv_dummy,
             block_table=page_table,
             block_size=k_cache.shape[1],
+            sparse_mode=sparse_mode,
         )
+        if sparse_mode == 4:
+            kwargs["pre_tokens"] = window_left
+            kwargs["next_tokens"] = 0
+            # All-False mask (no extra masking beyond sliding window)
+            kwargs["atten_mask"] = torch.zeros(
+                (1, 1, _MAX_ATTEN_SIZE, _MAX_ATTEN_SIZE),
+                dtype=torch.bool,
+                device=q.device,
+            )
+        else:
+            # sparse_mode=3: causal requires explicit atten_mask (CANN V3 API)
+            kwargs["atten_mask"] = _get_causal_mask(q.device)
+
+        torch.npu.graph_task_group_begin(stream)
+        out, _ = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
         handle = torch.npu.graph_task_group_end(stream)
+
         # Store handle + tensor references for pre-replay parameter update.
-        # NOTE: k/v tensors already have repeated heads, so num_key_value_heads
-        # equals num_q_heads. The graph_task_update path uses these stored
-        # tensors directly, so it naturally sees the repeated layout.
+        # The graph_task_update path uses these stored tensors directly.
         _decode_attn_capture_handles.append({
             "handle": handle,
-            "q": q_bnsd,
-            "k": k_bnsd,
-            "v": v_bnsd,
+            "q": q_tnd,
+            "k": k_tnd,
+            "v": v_tnd,
             "num_heads": num_q_heads,
-            "num_key_value_heads": k_bnsd.shape[1],
+            "num_key_value_heads": num_kv_heads,
             "scale": scale,
             "block_table": page_table,
             "block_size": k_cache.shape[1],
+            "sparse_mode": sparse_mode,
+            "pre_tokens": window_left if sparse_mode == 4 else None,
+            "next_tokens": 0 if sparse_mode == 4 else None,
+            "atten_mask": kwargs["atten_mask"],
+            "max_seqlen_q": max_seqlen_q,
         })
+        # TND output is already [total_q, num_q_heads, head_dim]; reshape for safety
         out = out.reshape(-1, num_q_heads, head_dim)
     else:
-        # ---- Normal (non-capturing) path: try fused then SDPA ----
+        # ---- Normal (non-capturing) path: try TND fused then SDPA ----
         use_fused = False
-        fused_kv_heads = k_cache.shape[2]
         if fused_attn is not None:
             try:
-                seq_lens_list = [int(s) for s in cache_seqlens]
-                q_bnsd = q_4d.transpose(1, 2)
-                k_bnsd = k_cache.transpose(1, 2)
-                v_bnsd = v_cache.transpose(1, 2)
-                # Manually repeat KV heads for GQA to avoid CANN non-power-of-2 ratio issue
-                if num_q_heads != fused_kv_heads:
-                    n_reps = num_q_heads // fused_kv_heads
-                    k_bnsd = k_bnsd.repeat_interleave(n_reps, dim=1)
-                    v_bnsd = v_bnsd.repeat_interleave(n_reps, dim=1)
-                out, _ = fused_attn(
-                    q_bnsd, k_bnsd, v_bnsd,
-                    actual_seq_lengths=seq_lens_list,
-                    actual_seq_lengths_kv=seq_lens_list,
+                # TND layout: q is [total_q, num_q_heads, head_dim] — use directly
+                q_tnd = q
+                k_tnd = k_cache.transpose(1, 2)
+                v_tnd = v_cache.transpose(1, 2)
+
+                # Build cumulative q lengths from max_seqlen_q
+                cum_seq_q = []
+                running = 0
+                for _ in range(batch_size):
+                    running += max_seqlen_q
+                    cum_seq_q.append(running)
+
+                # Build cumulative KV lengths from cache_seqlens
+                cum_seq_kv = []
+                running = 0
+                for i in range(batch_size):
+                    running += int(cache_seqlens[i])
+                    cum_seq_kv.append(running)
+
+                # Sparse mode
+                if window_left > 0:
+                    sparse_mode = 4
+                else:
+                    sparse_mode = 3
+
+                kwargs = dict(
                     num_heads=num_q_heads,
-                    num_key_value_heads=num_q_heads,
+                    num_key_value_heads=num_kv_heads,
                     scale=scale,
-                    input_layout="BNSD",
+                    input_layout="TND",
+                    actual_seq_lengths=cum_seq_q,
+                    actual_seq_lengths_kv=cum_seq_kv,
                     block_table=page_table,
                     block_size=k_cache.shape[1],
+                    sparse_mode=sparse_mode,
                 )
-                out = out.reshape(-1, num_q_heads, head_dim)
+                if sparse_mode == 4:
+                    kwargs["pre_tokens"] = window_left
+                    kwargs["next_tokens"] = 0
+                # sparse_mode 3 and 4 both need atten_mask on CANN V3
+                kwargs["atten_mask"] = (
+                    _get_causal_mask(q.device) if sparse_mode == 3
+                    else torch.zeros(
+                        (1, 1, _MAX_ATTEN_SIZE, _MAX_ATTEN_SIZE),
+                        dtype=torch.bool,
+                        device=q.device,
+                    )
+                )
+
+                out, _ = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
+                # TND output is [total_q, num_q_heads, head_dim] — already correct
                 use_fused = True
             except RuntimeError as e:
-                logger.warning("NPU fused attention failed, falling back to SDPA: %s", e)
+                logger.warning(
+                    "NPU fused attention failed, falling back to SDPA: %s", e
+                )
         if not use_fused:
             # Fallback: SDPA decode with proper page table gathering
             num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
-            batch_size = page_table.shape[0]
             max_pages_per_seq = page_table.shape[1]
             if batch_size == 1:
                 num_kv = int(cache_seqlens[0].item())

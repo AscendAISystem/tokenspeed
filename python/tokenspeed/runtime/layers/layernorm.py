@@ -98,21 +98,21 @@ class LayerNorm(nn.Module):
             return x
         if current_platform().is_npu:
             return F.layer_norm(
-                x.float(),
+                x,
                 (x.shape[-1],),
                 self.weight,
                 self.bias,
                 self.variance_epsilon,
-            ).to(x.dtype)
+            )
         if current_platform().is_nvidia:
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         return nn.functional.layer_norm(
-            x.float(),
+            x,
             (x.shape[-1],),
             self.weight,
             self.bias,
             self.variance_epsilon,
-        ).to(x.dtype)
+        )
 
 
 class RMSNorm(torch.nn.Module):
@@ -148,9 +148,9 @@ class RMSNorm(torch.nn.Module):
                     )
                 x = x + residual
                 residual_out = x.clone()
-                normed = F.rms_norm(x.float(), (x.shape[-1],), weight=self.weight.float(), eps=self.variance_epsilon)
-                return normed.to(x.dtype), residual_out
-            return F.rms_norm(x.float(), (x.shape[-1],), weight=self.weight.float(), eps=self.variance_epsilon).to(x.dtype)
+                normed = F.rms_norm(x, (x.shape[-1],), weight=self.weight, eps=self.variance_epsilon)
+                return normed, residual_out
+            return F.rms_norm(x, (x.shape[-1],), weight=self.weight, eps=self.variance_epsilon)
         elif _is_amd:
             if residual is not None:
                 if inplace:
@@ -337,10 +337,9 @@ class GemmaRMSNorm(torch.nn.Module):
                 x = x + residual
                 residual = x
 
-            x = x.float()
             variance = x.pow(2).mean(dim=-1, keepdim=True)
             x = x * torch.rsqrt(variance + self.variance_epsilon)
-            x = x * (1.0 + self.weight.float())
+            x = x * (1.0 + self.weight)
             x = x.to(orig_dtype)
             return x if residual is None else (x, residual)
         else:
@@ -517,7 +516,7 @@ class FusedRMSNorm(nn.Module):
                 (input_q_a, self.weight_q_a, output_q_a),
                 (input_kv_a, self.weight_kv_a, output_kv_a),
             ]:
-                normed = F.rms_norm(inp.float(), (inp.shape[-1],), weight=weight.float(), eps=self.q_a_norm.variance_epsilon)
+                normed = F.rms_norm(inp, (inp.shape[-1],), weight=weight, eps=self.q_a_norm.variance_epsilon)
                 if out is not None:
                     out.copy_(normed.to(inp.dtype))
                 else:

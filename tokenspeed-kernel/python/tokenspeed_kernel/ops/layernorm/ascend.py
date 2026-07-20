@@ -21,7 +21,7 @@
 """Ascend NPU layernorm backend.
 
 Registers NPU-optimized RMSNorm implementations:
-- ``rmsnorm`` and ``fused_add_rmsnorm`` → ``torch_npu.npu_add_rms_norm``
+- ``rmsnorm`` and ``fused_add_rmsnorm`` → ``F.rms_norm`` (bit-exact between NPU and CPU)
 - ``qk_rmsnorm`` → ``torch.nn.functional.rms_norm`` × 2
 """
 
@@ -72,8 +72,8 @@ def rmsnorm(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """RMS Normalization on Ascend NPU.
 
-    Uses ``npu_add_rms_norm`` when available (supports fused residual),
-    otherwise falls back to ``F.rms_norm``.
+    Uses ``torch.nn.functional.rms_norm`` on Ascend NPU.
+    The ``npu_add_rms_norm`` fused kernel is NOT used due to ~4.5% bf16 precision error on CANN 26.0.rc1.
 
     Args:
         x: Input tensor ``[..., hidden_size]``.
@@ -136,7 +136,7 @@ def fused_add_rmsnorm(
     weight: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused add + RMSNorm using ``npu_add_rms_norm`` on Ascend NPU.
+    """Fused add + RMSNorm using ``F.rms_norm`` on Ascend NPU.
 
     Computes ``residual_out = x + residual`` and
     ``output = rms_norm(residual_out, weight)`` in a single fused operation.
