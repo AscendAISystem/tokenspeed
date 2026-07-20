@@ -172,11 +172,18 @@ def npu_mha_prefill(
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """MHA prefill using Ascend NPU ``npu_fused_infer_attention_score``.
+    """MHA prefill using per-batch PyTorch SDPA with causal masking.
 
-    Uses TND layout with ``sparse_mode=3`` (causal) or ``sparse_mode=4``
-    (sliding-window) for correct autoregressive masking.  Falls back to
-    PyTorch SDPA when the fused kernel is unavailable.
+    Uses per-batch ``scaled_dot_product_attention`` with ``is_causal=True``
+    for correct block-diagonal autoregressive masking in packed sequences.
+
+    .. note::
+
+       CANN's ``npu_fused_infer_attention_score`` with TND layout
+       and ``sparse_mode=3`` does **not** apply proper causal masking
+       on CANN 2.10.0 (the output is identical to ``sparse_mode=0``).
+       The forward-looking TND+fused path is coded but gated behind a
+       version check for future CANN releases that fix this behaviour.
 
     Args:
         q: Query tensor shaped ``[total_q, num_q_heads, head_dim]``.
