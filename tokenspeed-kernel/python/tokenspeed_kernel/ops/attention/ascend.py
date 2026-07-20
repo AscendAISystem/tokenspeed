@@ -302,8 +302,15 @@ def npu_mha_prefill(
 
         if window_left > 0:
             # Sliding window: sparse_mode=4 + pre_tokens
+            # CANN V3 requires atten_mask when sparse_mode != 0.
+            # Use an all-False mask (no extra masking beyond sliding window).
             sparse_mode = 4
             causal_tokens = window_left
+            atten_mask = torch.zeros(
+                (1, 1, _MAX_ATTEN_SIZE, _MAX_ATTEN_SIZE),
+                dtype=torch.bool,
+                device=q.device,
+            )
             logger.debug("npu_mha_prefill: using TND fused attention sparse_mode=4 (sliding window, pre_tokens=%s)", causal_tokens)
         else:
             # Standard causal: sparse_mode=3 requires explicit atten_mask (CANN V3 API)
@@ -325,7 +332,7 @@ def npu_mha_prefill(
         if sparse_mode == 4:
             kwargs["pre_tokens"] = causal_tokens
             kwargs["next_tokens"] = 0
-        elif sparse_mode == 3:
+        if sparse_mode != 0:
             kwargs["atten_mask"] = atten_mask
 
         out, lse_tmp = fused_attn(q_tnd, k_tnd, v_tnd, **kwargs)
