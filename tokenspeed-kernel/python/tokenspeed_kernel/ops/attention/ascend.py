@@ -203,6 +203,10 @@ def _is_npu_available() -> bool:
 
 def _get_fused_attention_score():
     """Return ``torch_npu.npu_fused_infer_attention_score`` or None."""
+    import os
+    if os.environ.get("TOKENSPEED_NPU_DISABLE_FUSED_ATTN"):
+        logger.info("TOKENSPEED_NPU_DISABLE_FUSED_ATTN set, forcing SDPA fallback")
+        return None
     try:
         import torch_npu  # noqa: F401
         return torch.ops.npu.npu_fused_infer_attention_score
