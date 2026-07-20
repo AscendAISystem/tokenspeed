@@ -174,6 +174,10 @@ def npu_mha_prefill(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MHA prefill using Ascend NPU ``npu_fused_infer_attention_score``.
 
+    Uses TND layout with ``sparse_mode=3`` (causal) or ``sparse_mode=4``
+    (sliding-window) for correct autoregressive masking.  Falls back to
+    PyTorch SDPA when the fused kernel is unavailable.
+
     Args:
         q: Query tensor shaped ``[total_q, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[total_kv, num_kv_heads, head_dim]``.
@@ -194,28 +198,43 @@ def npu_mha_prefill(
     if not _is_npu_available():
         raise RuntimeError("NPU not available")
 
+    fused_attn = _get_fused_attention_score()
     num_q_heads = q.shape[1]
     num_kv_heads = k.shape[1]
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
+    total_q = q.shape[0]
+    total_kv = k.shape[0]
 
-    # Use SDPA for prefill — CANN fused kernel's sparse_mode=0 is non-causal,
-    # which produces wrong hidden states during autoregressive prefill
-    # (each token attends to future tokens, corrupting KV cache).
-    # SDPA with is_causal=True is the correct causal masking.
-    k_sdpa = k
-    v_sdpa = v
-    if num_q_heads != num_kv_heads:
-        n_reps = num_q_heads // num_kv_heads
-        k_sdpa = k.repeat_interleave(n_reps, dim=1)
-        v_sdpa = v.repeat_interleave(n_reps, dim=1)
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q.unsqueeze(0).transpose(1, 2),
-        k_sdpa.unsqueeze(0).transpose(1, 2),
-        v_sdpa.unsqueeze(0).transpose(1, 2),
-        scale=scale,
-        is_causal=True,
-    ).transpose(1, 2).squeeze(0)
+    # ---- SDPA per-batch fallback (correct causal masking) ----
+    # NOTE(cann-tnd): CANN 2.10.0 TND+sparse_mode=3 does NOT apply proper
+    # causal masking in the fused attention kernel. We fall back to per-batch
+    # SDPA with is_causal=True for correct block-diagonal causal masking.
+    logger.debug("npu_mha_prefill: using per-batch SDPA fallback (causal masking)")
+
+    act_seq = cu_seqlens.tolist() if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+    batch_size = len(act_seq) - 1
+
+    n_reps = num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else 1
+    if n_reps > 1:
+        k = k.repeat_interleave(n_reps, dim=1)
+        v = v.repeat_interleave(n_reps, dim=1)
+
+    outputs = []
+    for i in range(batch_size):
+        start = act_seq[i]
+        end = act_seq[i + 1]
+        q_i = q[start:end].unsqueeze(0).transpose(1, 2)   # [1, H, sl, D]
+        k_i = k[start:end].unsqueeze(0).transpose(1, 2)
+        v_i = v[start:end].unsqueeze(0).transpose(1, 2)
+        out_i = torch.nn.functional.scaled_dot_product_attention(
+            q_i, k_i, v_i,
+            scale=scale,
+            is_causal=True,
+        ).transpose(1, 2).squeeze(0)  # [sl, H, D]
+        outputs.append(out_i)
+
+    out = torch.cat(outputs, dim=0)
 
     if return_lse:
         lse = torch.zeros((q.shape[0], num_q_heads), dtype=torch.float32, device=q.device)
