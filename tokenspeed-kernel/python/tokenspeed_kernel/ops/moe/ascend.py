@@ -435,6 +435,16 @@ def npu_ascend_moe_apply(
     n_tokens = x.shape[0]
     hidden_size = x.shape[-1]
     num_experts = getattr(w, "num_experts", router_logits.shape[-1])
+    num_local_experts = int(getattr(w, "num_local_experts", num_experts))
+    # Local EP: offset+mask to convert global expert IDs to local
+    ep_size = int(getattr(w, "ep_size", 1))
+    if ep_size > 1:
+        expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
+        local_ids = topk_ids - expert_offset
+        local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+        topk_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+        topk_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
+        num_experts = num_local_experts
 
     # ------------------------------------------------------------------
     # M05: Dispatch tokens by expert (sort-based routing)
