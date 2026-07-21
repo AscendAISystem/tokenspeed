@@ -20,7 +20,7 @@
 
 """Ascend NPU rotary embedding backend.
 
-Registers NPU-optimized RoPE implementation using ``torch_npu.npu_rotary_embedding``.
+Registers NPU-optimized RoPE implementation using ``torch_npu.npu_apply_rotary_pos_emb``.
 """
 
 from __future__ import annotations
@@ -42,10 +42,10 @@ def _is_npu_available() -> bool:
 
 
 def _get_npu_rotary_embedding():
-    """Return ``torch_npu.npu_rotary_embedding`` callable or ``None``."""
+    """Return ``torch_npu.npu_apply_rotary_pos_emb`` callable or ``None``."""
     try:
         import torch_npu  # noqa: F401
-        return torch.ops.npu.npu_rotary_embedding
+        return torch.ops.npu.npu_apply_rotary_pos_emb
     except (ImportError, AttributeError, RuntimeError):
         return None
 
@@ -87,7 +87,7 @@ def npu_embedding_rope(
     k_rope_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> None:
-    """Apply rotary positional embedding using ``npu_rotary_embedding``.
+    """Apply rotary positional embedding using ``npu_apply_rotary_pos_emb``.
 
     Args:
         positions: Token positions, 1D ``[num_tokens]``.
@@ -126,9 +126,8 @@ def npu_embedding_rope(
 
     rotary_emb = _get_npu_rotary_embedding()
     if rotary_emb is not None:
-        # npu_rotary_embedding: applies rotation using cos/sin cache
-        # Format depends on the API version; typically:
-        #   npu_rotary_embedding(x, cos, sin) -> rotated_x
+        # npu_apply_rotary_pos_emb: applies rotation using cos/sin cache
+        # Signature: (q, k, cos, sin, layout='BSH', rotary_mode='half') -> (q_out, k_out)
         cos = cos_sin_cache[positions, :rotary_dim // 2]  # [num_tokens, half_rotary]
         sin = cos_sin_cache[positions, rotary_dim // 2:rotary_dim]  # [num_tokens, half_rotary]
 
@@ -183,7 +182,15 @@ def _apply_neox_rope(
     rotary_dim: int,
     rotary_emb,
 ) -> torch.Tensor:
-    """Apply Neox-style RoPE using npu_rotary_embedding or native ops."""
+    """Apply Neox-style RoPE using ``npu_apply_rotary_pos_emb`` or native ops.
+
+    The NPU op ``npu_apply_rotary_pos_emb`` with ``rotary_mode="half"``
+    implements the half-split (Neox) rotation pattern:
+        o[0:half] = x[0:half] * cos - x[half:rotary_dim] * sin
+        o[half:rotary_dim] = x[half:rotary_dim] * cos + x[0:half] * sin
+    where cos/sin must have **full** rotary_dim elements (repeated from the
+    half-sized cos/sin cache).
+    """
     half = rotary_dim // 2
     x1 = x[..., :half]
     x2 = x[..., half:rotary_dim]
@@ -192,8 +199,26 @@ def _apply_neox_rope(
     sin_2d = sin.unsqueeze(1)
 
     try:
-        # Try the NPU rotary embedding op directly
-        rotated = rotary_emb(x, cos, sin)
+        # npu_apply_rotary_pos_emb signature:
+        #   (q, k, cos, sin, layout='BSH', rotary_mode='half') -> (q_out, k_out)
+        # Shapes: q/k = [B, S, N, D], cos/sin = [B, S, 1, rotary_dim]
+        # The op requires **full** rotary_dim cos/sin (repeated from half cache).
+        x_4d = x.unsqueeze(0)  # [1, num_tokens, num_heads, head_size]
+        cos_4d = cos.unsqueeze(0).unsqueeze(2)  # [1, num_tokens, 1, half]
+        sin_4d = sin.unsqueeze(0).unsqueeze(2)
+        # Repeat cos/sin to full rotary_dim (both half-split halves use same cos/sin)
+        cos_full = torch.cat([cos_4d, cos_4d], dim=-1)  # [1, num_tokens, 1, rotary_dim]
+        sin_full = torch.cat([sin_4d, sin_4d], dim=-1)
+        # The op requires both q and k; pass a clone of x as dummy key.
+        k_dummy = x_4d.clone()
+        rotated_4d, _ = rotary_emb(x_4d, k_dummy, cos_full, sin_full, 'BSH', 'half')
+        # rotated_4d is a view of x_4d (in-place); squeeze back to 3D.
+        rotated = rotated_4d.squeeze(0)  # [num_tokens, num_heads, head_size]
+        # The NPU op only rotates up to rotary_dim when cos/sin have rotary_dim elements.
+        if rotary_dim < x.shape[-1]:
+            # Concatenate the unrotated tail from x (x was modified in-place, but
+            # elements beyond rotary_dim were untouched by the op).
+            rotated = torch.cat([rotated[..., :rotary_dim], x[..., rotary_dim:]], dim=-1)
         return rotated
     except (RuntimeError, TypeError):
         pass
@@ -214,17 +239,16 @@ def _apply_gptj_rope(
     rotary_dim: int,
     rotary_emb,
 ) -> torch.Tensor:
-    """Apply GPT-J-style RoPE using npu_rotary_embedding or native ops.
+    """Apply GPT-J-style RoPE using ``npu_apply_rotary_pos_emb`` or native ops.
 
     In GPT-J layout, pairs are interleaved: [x0, x1, x0, x1, ...].
+
+    **Note**: The NPU op ``npu_apply_rotary_pos_emb`` does NOT natively support
+    GPT-J interleaved pairs (its ``half``/``interleave`` modes both implement
+    half-split Neox-style rotation).  Since the op would silently produce
+    incorrect results for GPT-J, we skip it and always use the PyTorch fallback.
     """
     half = rotary_dim // 2
-
-    try:
-        rotated = rotary_emb(x, cos, sin)
-        return rotated
-    except (RuntimeError, TypeError):
-        pass
 
     # Pure PyTorch GPT-J rotation
     x_rot_part = x[..., :rotary_dim]
