@@ -632,16 +632,23 @@ def npu_ascend_moe_apply_native(
     hidden_size = x.shape[-1]
     num_experts = getattr(w, "num_experts", router_logits.shape[-1])
     num_local_experts = int(getattr(w, "num_local_experts", num_experts))
-    # Local EP: offset+mask to convert global expert IDs to local
     ep_size = int(getattr(w, "ep_size", 1))
     logger.info("[MoE] ascend_native 路径 (ep_size=%d)", ep_size)
+    # B方案: Use active_expert_range instead of -1 sentinel.
+    # DO NOT modify topk_ids — keep global expert IDs (0..num_experts-1).
+    # Only mask weights to zero for non-local experts.
+    # The active_expert_range parameter tells npu_moe_init_routing_v2
+    # which experts to actually route tokens to, dropping rest.
     if ep_size > 1:
         expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
         local_ids = topk_ids - expert_offset
         local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
         topk_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
-        topk_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
-        num_experts = num_local_experts
+        # topk_ids stays global (0..num_experts-1), DO NOT replace with -1
+        # num_experts stays as global count
+        active_range = [expert_offset, expert_offset + num_local_experts]
+    else:
+        active_range = [0, num_experts]
 
     w13_weight = getattr(w, "w13_weight", None)
     w2_weight = getattr(w, "w2_weight", None)
@@ -669,23 +676,19 @@ def npu_ascend_moe_apply_native(
     # ------------------------------------------------------------------
     # Step 1: Dispatch using NPU-native npu_moe_init_routing_v2
     #
-    # NOTE: npu_moe_init_routing_v2 does NOT handle -1 expert IDs.
-    # EP masking sets non-local experts to -1, which causes the op
-    # to return zero expert counts. So we replace -1 with 0 first
-    # (same as _moe_dispatch in the ascend fallback path). The zero
-    # weights for masked entries ensure no contribution to the output.
+    # B方案: Use active_expert_range to limit routing to local experts.
+    # No -1 sentinel cleanup needed because topk_ids are kept global
+    # and the op drops tokens routed outside the active range.
+    # This avoids wasted compute from -1→0 replacement and masked tokens.
     # ------------------------------------------------------------------
-    flat_ids_safe = torch.where(
-        topk_ids.reshape(-1) >= 0,
-        topk_ids.reshape(-1),
-        topk_ids.new_zeros(()).reshape(-1),
-    )
-    topk_ids_safe = flat_ids_safe.reshape(topk_ids.shape).contiguous().int()
+    topk_ids_input = topk_ids.contiguous().int()
     expanded_x, expanded_row_idx, expert_count, _ = torch_npu.npu_moe_init_routing_v2(
-        x, topk_ids_safe,
+        x, topk_ids_input,
         active_num=-1, expert_capacity=-1, expert_num=num_experts,
         drop_pad_mode=0, expert_tokens_num_type=1, expert_tokens_num_flag=True,
-        quant_mode=-1, active_expert_range=[0, num_experts], row_idx_type=0,
+        quant_mode=-1,
+        active_expert_range=active_range,  # ← B方案: restrict to local experts
+        row_idx_type=1,  # row_idx_type=1 → expanded_row_idx is sorted by expert ID (matches argsort order)
     )
     valid_count = expert_count.sum().item()
     if valid_count == 0:
@@ -697,6 +700,12 @@ def npu_ascend_moe_apply_native(
     # ------------------------------------------------------------------
     # Step 2: Build per-expert weight lists and group_list
     #         (no per-expert token list — use group_list instead)
+    #
+    # NOTE: With active_expert_range, expert_count is shaped
+    # [len(active_range)] (number of experts in range), indexed relative to
+    # the range start. So valid_ids[i] = local index of i-th active expert
+    # relative to active_range[0]. These are used directly as local indices
+    # for weight lookup — no offset conversion needed.
     # ------------------------------------------------------------------
     valid_mask = expert_count > 0
     valid_ids = valid_mask.nonzero().squeeze(-1)
@@ -713,6 +722,7 @@ def npu_ascend_moe_apply_native(
     has_bias_ep = (w13_weight_bias is not None and w13_weight_bias.dim() == 2)
 
     for eid in valid_ids.tolist():
+        # eid is relative to active_range[0] — use directly as local index
         if is_expert_parallel:
             gate_w = w13_weight[eid, :half_inter, :].T.contiguous()
             up_w = w13_weight[eid, half_inter:, :].T.contiguous()
@@ -792,21 +802,27 @@ def npu_ascend_moe_apply_native(
 
     # ------------------------------------------------------------------
     # Step 6: Weighted scatter-add to output buffer
-    #         Use sort_order (same safe IDs as Step 1, so the ordering
-    #         matches npu_moe_init_routing_v2) for weight permutation
-    #         and gather indices.
+    #         Use expanded_row_idx (returned by npu_moe_init_routing_v2)
+    #         instead of sort_order for weight permutation.
+    #
+    # expanded_row_idx maps each expanded (sorted-by-expert) row back to
+    # its original flat index in [0, n_tokens * top_k). This is the
+    # official way to trace tokens through the op — more direct and
+    # efficient than recomputing sort_order from flat_ids_safe.
     # ------------------------------------------------------------------
     flat_weights = topk_weights.reshape(-1)
-    sort_order = torch.argsort(flat_ids_safe.int(), stable=True)
-    permuted_weights = flat_weights[sort_order][:valid_count]
-    gather_indices = sort_order[:valid_count] // top_k
+
+    # expanded_row_idx[i] = original flat index of expanded row i
+    # Use it to permute weights to match the sorted-by-expert order
+    permuted_weights = flat_weights[expanded_row_idx.long()]
 
     output_buffer = torch.zeros(n_tokens, hidden_size, dtype=x.dtype, device=x.device)
     cum = 0
     for idx, _ in enumerate(valid_ids.tolist()):
         count = valid_counts[idx].item()
         weight_scalar = permuted_weights[cum:cum + count].unsqueeze(-1)
-        token_indices = gather_indices[cum:cum + count].long()
+        # expanded_row_idx is in flat space, // top_k gives token index
+        token_indices = (expanded_row_idx[cum:cum + count].long() // top_k)
         output_buffer.index_add_(
             0, token_indices,
             expert_out_list[idx] * weight_scalar.to(expert_out_list[idx].dtype),
