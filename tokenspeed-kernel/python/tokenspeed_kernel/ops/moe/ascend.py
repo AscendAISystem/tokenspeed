@@ -41,14 +41,19 @@ Routing scheme (M05):
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "npu_ascend_moe_apply",
+    "npu_ascend_moe_apply_native",
     "npu_ascend_moe_weights",
 ]
 
@@ -481,6 +486,7 @@ def npu_ascend_moe_apply(
     num_local_experts = int(getattr(w, "num_local_experts", num_experts))
     # Local EP: offset+mask to convert global expert IDs to local
     ep_size = int(getattr(w, "ep_size", 1))
+    logger.info("[MoE] ascend 路径 (torch API fallback, ep_size=%d)", ep_size)
     if ep_size > 1:
         expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
         local_ids = topk_ids - expert_offset
@@ -539,3 +545,263 @@ def npu_ascend_moe_apply(
     )
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Ascend MoE apply native kernel (M01 decomposition + NPU native dispatch)
+# ---------------------------------------------------------------------------
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="npu_ascend_moe_apply_native",
+    solution="ascend_native",
+    weight_preprocessor=npu_ascend_moe_weights,
+    capability=CapabilityRequirement(vendors=frozenset({"huawei"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16, torch.float32},
+    ),
+    traits={
+        "weight_dtype": frozenset({"fp8", "unquant", "bf16", "fp16"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(128, 128)}),
+        "supports_bias": frozenset({True, False}),
+    },
+    priority=Priority.PERFORMANT,
+)
+def npu_ascend_moe_apply_native(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """MoE expert computation using NPU native ops (ascend_native).
+
+    Uses ``torch_npu.npu_moe_init_routing_v2`` for NPU-native dispatch,
+    ``npu_grouped_matmul`` with ``group_list`` for compute (no per-expert
+    token list building), and ``index_add_`` for weighted scatter-add combine.
+
+    The ascend_native solution replaces the sort-based routing (M05) with
+    a dedicated NPU routing primitive while keeping the same M01 decomposed
+    matmul + swiglu + matmul expert compute structure.
+
+    Priority is set to PERFORMANT (vs PORTABLE for the ascend fallback),
+    so this kernel is preferred on NPU when both are registered.
+
+    Args:
+        plan: Execution plan from ``moe_plan``.
+        x: Hidden states ``[num_tokens, hidden_size]``.
+        w: Module with processed MoE weights.
+        router_logits: Router logits ``[num_tokens, num_experts]``.
+        topk_weights: Precomputed expert weights ``[num_tokens, top_k]``.
+        topk_ids: Precomputed expert ids ``[num_tokens, top_k]``.
+        num_tokens_global: Global token count (unused).
+        max_num_tokens_per_gpu: Max tokens per GPU (unused).
+        do_finalize: Whether to finalize (unused, always finalizes).
+        enable_pdl: PDL flag (unused).
+
+    Returns:
+        Output tensor ``[num_tokens, hidden_size]``.
+    """
+    del num_tokens_global, max_num_tokens_per_gpu, do_finalize, enable_pdl
+    if not _is_npu_available():
+        raise RuntimeError("NPU not available")
+
+    if topk_weights is None or topk_ids is None:
+        raise RuntimeError("Ascend MoE requires precomputed topk_weights/topk_ids")
+
+    import torch_npu  # noqa: F401
+
+    top_k = getattr(w, "top_k", topk_ids.shape[1])
+    n_tokens = x.shape[0]
+    hidden_size = x.shape[-1]
+    num_experts = getattr(w, "num_experts", router_logits.shape[-1])
+    num_local_experts = int(getattr(w, "num_local_experts", num_experts))
+    # Local EP: offset+mask to convert global expert IDs to local
+    ep_size = int(getattr(w, "ep_size", 1))
+    logger.info("[MoE] ascend_native 路径 (ep_size=%d)", ep_size)
+    if ep_size > 1:
+        expert_offset = int(getattr(w, "ep_rank", 0)) * num_local_experts
+        local_ids = topk_ids - expert_offset
+        local_mask = (local_ids >= 0) & (local_ids < num_local_experts)
+        topk_weights = torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+        topk_ids = torch.where(local_mask, local_ids, topk_ids.new_full((), -1))
+        num_experts = num_local_experts
+
+    w13_weight = getattr(w, "w13_weight", None)
+    w2_weight = getattr(w, "w2_weight", None)
+    if w13_weight is None or w2_weight is None:
+        raise RuntimeError("MoE weights not found on module")
+
+    # Read optional per-expert bias tensors
+    w13_weight_bias = getattr(w, "w13_weight_bias", None)
+    w2_weight_bias = getattr(w, "w2_weight_bias", None)
+
+    # Read GPT-OSS activation params
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    if swiglu_arg is not None:
+        swiglu_alpha = swiglu_arg.alpha
+        swiglu_limit = swiglu_arg.limit
+    else:
+        swiglu_alpha = None
+        swiglu_limit = None
+    swiglu_beta = getattr(w, "swiglu_beta", 0.0) or 0.0
+
+    is_expert_parallel = w13_weight.dim() == 3
+    total_inter = w13_weight.shape[1] if is_expert_parallel else w13_weight.shape[0]
+    half_inter = total_inter // 2
+
+    # ------------------------------------------------------------------
+    # Step 1: Dispatch using NPU-native npu_moe_init_routing_v2
+    # ------------------------------------------------------------------
+    topk_ids_int = topk_ids.contiguous().int()
+    expanded_x, expanded_row_idx, expert_count, _ = torch_npu.npu_moe_init_routing_v2(
+        x, topk_ids_int,
+        active_num=-1, expert_capacity=-1, expert_num=num_experts,
+        drop_pad_mode=0, expert_tokens_num_type=1, expert_tokens_num_flag=True,
+        quant_mode=-1, active_expert_range=[0, num_experts], row_idx_type=0,
+    )
+    valid_count = expert_count.sum().item()
+    if valid_count == 0:
+        return torch.zeros(n_tokens, hidden_size, dtype=x.dtype, device=x.device)
+
+    expanded_x = expanded_x[:valid_count]
+    expanded_row_idx = expanded_row_idx[:valid_count]
+
+    # ------------------------------------------------------------------
+    # Step 2: Build per-expert weight lists and group_list
+    #         (no per-expert token list — use group_list instead)
+    # ------------------------------------------------------------------
+    valid_mask = expert_count > 0
+    valid_ids = valid_mask.nonzero().squeeze(-1)
+    valid_counts = expert_count[valid_ids]
+    # group_list: cumsum of per-expert token counts (List[int] format)
+    group_list = valid_counts.cumsum(dim=0).int().tolist()
+
+    gate_w_list = []
+    up_w_list = []
+    down_w_list = []
+    gate_bias_list = [] if w13_weight_bias is not None else None
+    up_bias_list = [] if w13_weight_bias is not None else None
+    down_bias_list = [] if w2_weight_bias is not None else None
+    has_bias_ep = (w13_weight_bias is not None and w13_weight_bias.dim() == 2)
+
+    for eid in valid_ids.tolist():
+        if is_expert_parallel:
+            gate_w = w13_weight[eid, :half_inter, :].T.contiguous()
+            up_w = w13_weight[eid, half_inter:, :].T.contiguous()
+            down_w = (w2_weight[eid] if w2_weight.dim() == 3 else w2_weight).T.contiguous()
+            if w13_weight_bias is not None and has_bias_ep:
+                gate_bias_list.append(w13_weight_bias[eid, :half_inter])
+                up_bias_list.append(w13_weight_bias[eid, half_inter:])
+                down_bias_list.append(
+                    w2_weight_bias[eid] if w2_weight_bias is not None and w2_weight_bias.dim() == 2
+                    else None
+                )
+            elif w13_weight_bias is not None:
+                gate_bias_list.append(w13_weight_bias[:half_inter])
+                up_bias_list.append(w13_weight_bias[half_inter:])
+                down_bias_list.append(w2_weight_bias if w2_weight_bias is not None else None)
+        else:
+            gate_w = w13_weight[:half_inter, :].T.contiguous()
+            up_w = w13_weight[half_inter:, :].T.contiguous()
+            down_w = w2_weight.T.contiguous()
+            if w13_weight_bias is not None:
+                gate_bias_list.append(w13_weight_bias[:half_inter] if w13_weight_bias is not None else None)
+                up_bias_list.append(w13_weight_bias[half_inter:] if w13_weight_bias is not None else None)
+                down_bias_list.append(w2_weight_bias if w2_weight_bias is not None else None)
+
+        gate_w_list.append(gate_w)
+        up_w_list.append(up_w)
+        down_w_list.append(down_w)
+
+    # ------------------------------------------------------------------
+    # Step 3: Grouped matmul — gate and up projections
+    #         x is a single tensor, group_list splits by expert rows
+    # ------------------------------------------------------------------
+    x_list = [expanded_x]
+    gate_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        x_list, gate_w_list,
+        group_list=group_list, split_item=0, group_type=0, group_list_type=0,
+    )
+    up_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        x_list, up_w_list,
+        group_list=group_list, split_item=0, group_type=0, group_list_type=0,
+    )
+
+    # Add bias to gate and up if available
+    if w13_weight_bias is not None:
+        gate_out_list = [
+            g + b.unsqueeze(0) if b is not None else g
+            for g, b in zip(gate_out_list, gate_bias_list)
+        ]
+        up_out_list = [
+            u + b.unsqueeze(0) if b is not None else u
+            for u, b in zip(up_out_list, up_bias_list)
+        ]
+
+    # ------------------------------------------------------------------
+    # Step 4: SwiGLU activation (per-expert, elementwise)
+    # ------------------------------------------------------------------
+    act_out_list = [
+        _npu_swiglu(g, u, alpha=swiglu_alpha, beta=swiglu_beta, limit=swiglu_limit)
+        for g, u in zip(gate_out_list, up_out_list)
+    ]
+
+    # ------------------------------------------------------------------
+    # Step 5: Grouped matmul — down projection
+    # ------------------------------------------------------------------
+    cat_act = torch.cat(act_out_list, dim=0)
+    expert_out_list = torch.ops.npu.npu_grouped_matmul.List(
+        [cat_act], down_w_list,
+        group_list=group_list, split_item=0, group_type=0, group_list_type=0,
+    )
+
+    # Add down bias if available
+    if w2_weight_bias is not None and any(b is not None for b in down_bias_list):
+        expert_out_list = [
+            o + b.unsqueeze(0) if b is not None else o
+            for o, b in zip(expert_out_list, down_bias_list)
+        ]
+
+    # ------------------------------------------------------------------
+    # Step 6: Weighted scatter-add to output buffer
+    #         Use sort_order (same grouping as init_routing_v2) for
+    #         weight permutation and gather indices.
+    # ------------------------------------------------------------------
+    flat_weights = topk_weights.reshape(-1)
+    flat_ids = topk_ids.reshape(-1)
+    valid_mask_flat = flat_ids >= 0
+    safe_ids = torch.where(valid_mask_flat, flat_ids, flat_ids.new_zeros(()))
+    sort_order = torch.argsort(safe_ids.int(), stable=True)
+    permuted_weights = flat_weights[sort_order][:valid_count]
+    gather_indices = sort_order[:valid_count] // top_k
+
+    output_buffer = torch.zeros(n_tokens, hidden_size, dtype=x.dtype, device=x.device)
+    cum = 0
+    for idx, _ in enumerate(valid_ids.tolist()):
+        count = valid_counts[idx].item()
+        weight_scalar = permuted_weights[cum:cum + count].unsqueeze(-1)
+        token_indices = gather_indices[cum:cum + count].long()
+        output_buffer.index_add_(
+            0, token_indices,
+            expert_out_list[idx] * weight_scalar.to(expert_out_list[idx].dtype),
+        )
+        cum += count
+
+    return output_buffer
