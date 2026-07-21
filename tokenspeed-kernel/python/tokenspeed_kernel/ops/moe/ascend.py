@@ -668,10 +668,21 @@ def npu_ascend_moe_apply_native(
 
     # ------------------------------------------------------------------
     # Step 1: Dispatch using NPU-native npu_moe_init_routing_v2
+    #
+    # NOTE: npu_moe_init_routing_v2 does NOT handle -1 expert IDs.
+    # EP masking sets non-local experts to -1, which causes the op
+    # to return zero expert counts. So we replace -1 with 0 first
+    # (same as _moe_dispatch in the ascend fallback path). The zero
+    # weights for masked entries ensure no contribution to the output.
     # ------------------------------------------------------------------
-    topk_ids_int = topk_ids.contiguous().int()
+    flat_ids_safe = torch.where(
+        topk_ids.reshape(-1) >= 0,
+        topk_ids.reshape(-1),
+        topk_ids.new_zeros(()).reshape(-1),
+    )
+    topk_ids_safe = flat_ids_safe.reshape(topk_ids.shape).contiguous().int()
     expanded_x, expanded_row_idx, expert_count, _ = torch_npu.npu_moe_init_routing_v2(
-        x, topk_ids_int,
+        x, topk_ids_safe,
         active_num=-1, expert_capacity=-1, expert_num=num_experts,
         drop_pad_mode=0, expert_tokens_num_type=1, expert_tokens_num_flag=True,
         quant_mode=-1, active_expert_range=[0, num_experts], row_idx_type=0,
@@ -781,14 +792,12 @@ def npu_ascend_moe_apply_native(
 
     # ------------------------------------------------------------------
     # Step 6: Weighted scatter-add to output buffer
-    #         Use sort_order (same grouping as init_routing_v2) for
-    #         weight permutation and gather indices.
+    #         Use sort_order (same safe IDs as Step 1, so the ordering
+    #         matches npu_moe_init_routing_v2) for weight permutation
+    #         and gather indices.
     # ------------------------------------------------------------------
     flat_weights = topk_weights.reshape(-1)
-    flat_ids = topk_ids.reshape(-1)
-    valid_mask_flat = flat_ids >= 0
-    safe_ids = torch.where(valid_mask_flat, flat_ids, flat_ids.new_zeros(()))
-    sort_order = torch.argsort(safe_ids.int(), stable=True)
+    sort_order = torch.argsort(flat_ids_safe.int(), stable=True)
     permuted_weights = flat_weights[sort_order][:valid_count]
     gather_indices = sort_order[:valid_count] // top_k
 
