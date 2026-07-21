@@ -57,16 +57,49 @@ def _is_npu_available() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _npu_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+def _npu_swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    alpha: float | None = None,
+    beta: float = 0.0,
+    limit: float | None = None,
+) -> torch.Tensor:
     """Compute SwiGLU activation on NPU.
 
-    Uses NPU-native ``torch.ops.npu.npu_swiglu`` when available for better
-    performance, otherwise falls back to ``F.silu(gate) * up``.
+    Supports both standard SwiGLU (silu(gate) * up) and GPT-OSS style
+    non-standard activation: (up + beta) * (gate * sigmoid(alpha * gate))
+    with optional clamping.
 
-    The NPU op expects gate and up concatenated along the last dimension:
-    ``npu_swiglu(concat([gate, up], dim=-1), dim=-1) -> act`` where
-    ``act = silu(gate) * up``.
+    Standard path: uses NPU-native ``torch.ops.npu.npu_swiglu`` when
+    available for better performance, otherwise falls back to
+    ``F.silu(gate) * up``.
+
+    GPT-OSS path (when beta != 0.0): replicates the HF reference:
+    ``gate = gate.clamp(max=limit)``,
+    ``up = up.clamp(min=-limit, max=limit)``,
+    ``gate_act = gate * sigmoid(alpha * gate)``,
+    ``output = (up + beta) * gate_act``.
+
+    Args:
+        gate: Gate tensor.
+        up: Up tensor.
+        alpha: GPT-OSS activation alpha (e.g. 1.702 for GPT-OSS-20B).
+        beta: GPT-OSS up factor (e.g. 1.0 for GPT-OSS-20B). When 0.0,
+              standard SwiGLU is used (default).
+        limit: Clamp limit (e.g. 7.0 for GPT-OSS-20B).
+
+    Returns:
+        Activation output tensor.
     """
+    if beta != 0.0:
+        # GPT-OSS style: (up + beta) * (gate * sigmoid(alpha * gate))
+        if limit is not None:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(min=-limit, max=limit)
+        gate_act = gate * torch.sigmoid(gate * alpha) if alpha is not None else gate * torch.sigmoid(gate)
+        return (up + beta) * gate_act
+
+    # Standard SwiGLU
     try:
         import torch_npu  # noqa: F401
         combined = torch.cat([gate, up], dim=-1)
@@ -210,6 +243,9 @@ def _expert_compute(
     device: torch.device,
     w13_weight_bias: torch.Tensor | None = None,
     w2_weight_bias: torch.Tensor | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float = 0.0,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Compute per-expert matmuls with SwiGLU activation using npu_grouped_matmul.
 
@@ -237,6 +273,11 @@ def _expert_compute(
         device: Computing device.
         w13_weight_bias: Optional ``[num_experts, K]`` bias for fused gate+up.
         w2_weight_bias: Optional ``[num_experts, H]`` bias for down projection.
+        swiglu_alpha: GPT-OSS activation alpha (e.g. 1.702). Passed to
+            ``_npu_swiglu`` when ``swiglu_beta != 0``.
+        swiglu_beta: GPT-OSS up factor (e.g. 1.0). When non-zero, uses
+            GPT-OSS style activation instead of standard SwiGLU.
+        swiglu_limit: Clamp limit for GPT-OSS activation (e.g. 7.0).
 
     Returns:
         Output tensor ``[n_tokens, hidden_size]``.
@@ -323,8 +364,10 @@ def _expert_compute(
         ]
 
     # SwiGLU activation (elementwise, per-expert)
+    # Pass through GPT-OSS activation params if applicable (swiglu_beta != 0)
     act_out_list = [
-        _npu_swiglu(g, u) for g, u in zip(gate_out_list, up_out_list)
+        _npu_swiglu(g, u, alpha=swiglu_alpha, beta=swiglu_beta, limit=swiglu_limit)
+        for g, u in zip(gate_out_list, up_out_list)
     ]
 
     # Grouped matmul: all experts' down projections
@@ -465,6 +508,16 @@ def npu_ascend_moe_apply(
     w13_weight_bias = getattr(w, "w13_weight_bias", None)
     w2_weight_bias = getattr(w, "w2_weight_bias", None)
 
+    # Read GPT-OSS activation params from module (set in MoELayer.__init__)
+    swiglu_arg = getattr(w, "swiglu_arg", None)
+    if swiglu_arg is not None:
+        swiglu_alpha = swiglu_arg.alpha
+        swiglu_limit = swiglu_arg.limit
+    else:
+        swiglu_alpha = None
+        swiglu_limit = None
+    swiglu_beta = getattr(w, "swiglu_beta", 0.0) or 0.0
+
     output = _expert_compute(
         dispatched_hidden=dispatched_hidden,
         sorted_weights=sorted_weights,
@@ -480,6 +533,9 @@ def npu_ascend_moe_apply(
         device=x.device,
         w13_weight_bias=w13_weight_bias,
         w2_weight_bias=w2_weight_bias,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
 
     return output
