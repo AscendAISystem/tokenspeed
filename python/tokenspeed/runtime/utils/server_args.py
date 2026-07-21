@@ -422,6 +422,8 @@ class ServerArgs:
             # into greedy explicitly via ``--sampling-backend greedy``.
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
+            elif current_platform().is_npu:
+                self.sampling_backend = "ascend"
             else:
                 self.sampling_backend = "greedy"
 

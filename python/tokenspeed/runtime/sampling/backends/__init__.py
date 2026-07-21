@@ -20,3 +20,6 @@
 
 # Concrete backend modules are imported lazily in sampling.registry to avoid
 # circular imports (default.py imports register_backend from registry).
+#
+# The ascend backend is imported unconditionally; registration is guarded by
+# the backend's own checks on NPU availability at runtime.
