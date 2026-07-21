@@ -21,6 +21,7 @@
 
 import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -157,6 +158,11 @@ class MoELayer(torch.nn.Module):
             )
         ):
             self._quant_kind = quant_config.moe_weight_dtype()
+
+        # NPU does not natively support MXFP4 — dequant to bf16 during
+        # loading, so create unquant (bf16) parameters.
+        if self._quant_kind == "mxfp4" and current_platform().is_npu:
+            self._quant_kind = "unquant"
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"

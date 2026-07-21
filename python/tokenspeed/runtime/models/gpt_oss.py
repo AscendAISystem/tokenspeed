@@ -660,29 +660,23 @@ class GptOssForCausalLM(BaseCausalLM):
         if is_nextn:
             raise ValueError("GPT-OSS does not support nextn weight loading.")
 
-        # On NPU, quant_config may be None for MXFP4 models (since NPU kernel
-        # lacks MXFP4 support). Detect MXFP4 checkpoint by looking for packed
-        # block weights and dequantize to bfloat16 during loading.
-        # NOTE: must check from config, not by scanning weights (doing so would
-        # consume the weights generator and lose the first few tensors).
+        # Detect MXFP4 checkpoint from config (not by scanning weights, which
+        # would consume the generator). On NPU, MXFP4 is not natively supported
+        # so we dequantize to bf16 during loading.
         _is_mxfp4_ckpt = (
             getattr(self.config, "quantization_config", None) or {}
         ).get("quant_method", "") == "mxfp4"
-        is_mxfp4_checkpoint = (
-            quant_config_name is None
-            and current_platform().is_npu
-            and _is_mxfp4_ckpt
-        )
 
-        if quant_config_name == "mxfp4" or is_mxfp4_checkpoint:
-            if is_mxfp4_checkpoint:
-                self._load_mxfp4_weights_dequantized(
-                    weights, weight_name_mapping=weight_name_mapping
-                )
-            else:
-                self._load_mxfp4_weights(
-                    weights, weight_name_mapping=weight_name_mapping
-                )
+        # On NPU, MXFP4 is not natively supported — dequantize to bf16
+        # unconditionally. On CUDA, keep native MXFP4 format.
+        if current_platform().is_npu and _is_mxfp4_ckpt:
+            self._load_mxfp4_weights_dequantized(
+                weights, weight_name_mapping=weight_name_mapping
+            )
+        elif quant_config_name == "mxfp4":
+            self._load_mxfp4_weights(
+                weights, weight_name_mapping=weight_name_mapping
+            )
         else:
             self._load_normal_weights(weights, weight_name_mapping=weight_name_mapping)
 
@@ -798,6 +792,15 @@ class GptOssForCausalLM(BaseCausalLM):
                 # Map checkpoint name to model param name
                 new_name = name.replace("gate_up_proj_blocks", "w13_weight")
                 dq = _dequantize_mxfp4_blocks(blocks, scales)
+                # NOTE: MXFP4 blocks store values with axes
+                # [E, 2*intermediate, hidden_groups, bytes] and after
+                # dequant the shape is [E, 2*inter, hidden].  The unquant
+                # parameter w13_weight has shape [E, 2*inter, hidden] and
+                # the Ascend/NVIDIA kernel accesses it with a .T op
+                # (gate_w = w13_weight[e, :half, :].T), which applies a
+                # second transpose that cancels out the block-layout
+                # permutation — therefore NO explicit transpose is needed
+                # here for gate_up_proj.
                 narrow_weight = dq[
                     moe_ep_rank_start:moe_ep_rank_end,
                     2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
@@ -809,6 +812,19 @@ class GptOssForCausalLM(BaseCausalLM):
             elif "down_proj" in name:
                 new_name = name.replace("down_proj_blocks", "w2_weight")
                 dq = _dequantize_mxfp4_blocks(blocks, scales)
+                # MXFP4 blocks store values with axes
+                # [E, intermediate_groups, hidden_groups, bytes] and after
+                # dequant the shape is [E, inter, hidden].  The unquant
+                # parameter w2_weight has shape [E, hidden, inter], but
+                # the dequantised values are *permuted*: element
+                # [e, h, i] in DQ corresponds to HF[e, i, h].  When the
+                # kernel does down_w = w2_weight[e].T (transpose of the
+                # already-permuted values), the double-transpose does NOT
+                # cancel out — unlike gate_up_proj — because the down_proj
+                # matrix is square (hidden==inter on GPT-OSS-20B), which
+                # masks the axis swap during elementwise copy.  Transpose
+                # here so that the copy into the param corrects the layout.
+                dq = dq.transpose(1, 2).contiguous()  # [E, hidden, inter]
                 narrow_weight = dq[
                     moe_ep_rank_start:moe_ep_rank_end,
                     :,
