@@ -792,15 +792,18 @@ class GptOssForCausalLM(BaseCausalLM):
                 # Map checkpoint name to model param name
                 new_name = name.replace("gate_up_proj_blocks", "w13_weight")
                 dq = _dequantize_mxfp4_blocks(blocks, scales)
-                # NOTE: MXFP4 blocks store values with axes
-                # [E, 2*intermediate, hidden_groups, bytes] and after
-                # dequant the shape is [E, 2*inter, hidden].  The unquant
-                # parameter w13_weight has shape [E, 2*inter, hidden] and
-                # the Ascend/NVIDIA kernel accesses it with a .T op
-                # (gate_w = w13_weight[e, :half, :].T), which applies a
-                # second transpose that cancels out the block-layout
-                # permutation — therefore NO explicit transpose is needed
-                # here for gate_up_proj.
+                # HF stores gate and up in interleaved layout
+                # ([w1_0, w3_0, w1_1, w3_1, ...]) where rows at even
+                # positions are gate and odd positions are up.  The NPU
+                # kernel expects contiguous layout (first half gate,
+                # second half up).  Permute rows from interleaved to
+                # contiguous so that gate = dq[:, :half_inter, :] and
+                # up = dq[:, half_inter:, :] produce correct values.
+                inter = dq.shape[1] // 2
+                dq = torch.cat([
+                    dq[:, 0::2, :],   # even rows → gate
+                    dq[:, 1::2, :],   # odd rows → up
+                ], dim=1).contiguous()
                 narrow_weight = dq[
                     moe_ep_rank_start:moe_ep_rank_end,
                     2 * moe_tp_rank_start : 2 * moe_tp_rank_end,
