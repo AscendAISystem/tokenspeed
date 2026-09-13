@@ -251,7 +251,7 @@ if current_platform().is_npu:
         priority=Priority.PERFORMANT,
         traits={
             **_NPU_OPTIONS,
-            "page_size": frozenset({64, 128}),
+            "page_size": frozenset({16, 64, 128}),
             "is_causal": frozenset({False, True}),
         },
         tags={"portability"},
@@ -271,7 +271,7 @@ if current_platform().is_npu:
         priority=Priority.PERFORMANT,
         traits={
             **_NPU_OPTIONS,
-            "page_size": frozenset({64, 128}),
+            "page_size": frozenset({16, 64, 128}),
             "q_len": frozenset({1}),
         },
         tags={"portability"},
