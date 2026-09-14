@@ -576,10 +576,15 @@ def _sample_top_k_top_p_npu(
         min_p_log_threshold = torch.full((rows,), float("-inf"), device=device)
 
     scaled = logits.float() / temperature[:, None]  # [rows, vocab]
-    # NPU Graph capture forbids host sync (.item()), so use a fixed candidate
-    # pool sized like the CUDA Triton kernel's top_k_pad; the top-p/min-p
-    # filters live in the keep mask below, so semantics are unchanged.
-    max_k = min(vocab_size, _NPU_SAMPLE_MAX_K)
+    # Candidate pool: during graph capture host sync is forbidden, so fall
+    # back to a fixed pool (sized like the CUDA Triton kernel's top_k_pad).
+    # In eager mode use the real per-request top_k (largest in the batch) so
+    # the pool never truncates the distribution the caller asked for; the
+    # top-p/min-p filters live in the keep mask below, so semantics hold.
+    if _npu_capturing():
+        max_k = min(vocab_size, _NPU_SAMPLE_MAX_K)
+    else:
+        max_k = min(vocab_size, int(top_k.max().item()))
     if max_k <= 0:
         max_k = 1
     topk_vals, topk_idx = torch.topk(scaled, k=max_k, dim=-1)  # descending

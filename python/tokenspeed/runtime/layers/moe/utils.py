@@ -24,8 +24,6 @@ import logging
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
-from tokenspeed_kernel.platform import current_platform
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -192,14 +190,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_MODE
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
 
-    # On Ascend NPU there is no DeepEP / NVLink one-sided all-to-all; the
-    # default ("none") is replaced by the portable HCCL all-to-all so EP
-    # MoE keeps working (adaptation rule R38). Explicit GPU choices are
-    # left untouched.
-    all2all_value = server_args.all2all_backend
-    if all2all_value in (None, "none") and current_platform().is_npu:
-        all2all_value = "hccl"
-    ALL2ALL_BACKEND = All2AllBackend(all2all_value)
+    ALL2ALL_BACKEND = All2AllBackend(server_args.all2all_backend)
     MOE_BACKEND = MoeBackend(server_args.moe_backend)
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
@@ -211,10 +202,7 @@ def get_all2all_backend() -> All2AllBackend:
     global ALL2ALL_BACKEND
     if ALL2ALL_BACKEND is None:
         logger.warning("ALL2ALL_BACKEND is not initialized, using default backend")
-        # NPU default: portable HCCL all-to-all; GPU default stays "none".
-        ALL2ALL_BACKEND = (
-            All2AllBackend.HCCL if current_platform().is_npu else All2AllBackend.NONE
-        )
+        ALL2ALL_BACKEND = All2AllBackend.NONE
     return ALL2ALL_BACKEND
 
 

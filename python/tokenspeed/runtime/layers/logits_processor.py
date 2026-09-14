@@ -740,7 +740,8 @@ class LogitsProcessor(nn.Module):
             if self.do_argmax:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and (current_platform().is_npu or not torch.cuda.is_current_stream_capturing())
+                    and not current_platform().is_npu
+                    and not torch.cuda.is_current_stream_capturing()
                 ):
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
