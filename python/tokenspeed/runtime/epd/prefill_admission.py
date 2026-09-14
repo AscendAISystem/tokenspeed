@@ -54,7 +54,6 @@ from typing import Any
 
 import torch
 from tokenspeed.runtime.utils.common import get_device_module
-from typing import Any
 import torch.distributed as dist
 
 logger = logging.getLogger(__name__)

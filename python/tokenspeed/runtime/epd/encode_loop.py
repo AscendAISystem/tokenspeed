@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import time
 
+import torch
 import zmq
 
 from tokenspeed.runtime.cache.embedding_cache import (

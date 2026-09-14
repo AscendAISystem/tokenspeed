@@ -32,7 +32,6 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-import torch
 from tokenspeed.runtime.utils.common import get_device_module
 
 _ext = None

@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
-from typing import Any
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.grammar.capturable_grammar import (
