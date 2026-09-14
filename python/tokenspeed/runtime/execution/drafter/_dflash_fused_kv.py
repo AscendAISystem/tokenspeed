@@ -231,8 +231,15 @@ def _fused_norm_rope_stacked_scatter(
         # the RMSNorm(K) + RoPE(K) materialization with torch ops, then
         # scatter each layer's rows into the KV pool buffers at ``loc``.
         device = kv.device
-        k = kv[..., :kv_size].view(n_layers, total_ctx, num_kv_heads, head_dim)
-        v = kv[..., kv_size:].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        # kv layout is [total_ctx, n_layers, kv_size*2]; permute to
+        # [n_layers, total_ctx, kv_size] before the 4D reshapes so the
+        # layer/context axes map to the same memory the Triton kernel reads.
+        k = kv[..., :kv_size].permute(1, 0, 2).contiguous().view(
+            n_layers, total_ctx, num_kv_heads, head_dim
+        )
+        v = kv[..., kv_size:].permute(1, 0, 2).contiguous().view(
+            n_layers, total_ctx, num_kv_heads, head_dim
+        )
         k_f = k.to(torch.float32)
         inv_rms = torch.rsqrt(
             k_f.pow(2).mean(dim=-1, keepdim=True)
@@ -451,8 +458,15 @@ def _fused_norm_rope_stacked(
         # RMSNorm(K) + RoPE(K) per layer, V stored raw.
         device = kv.device
         expected_shape = (n_layers, total_ctx, num_kv_heads, head_dim)
-        k = kv[..., :kv_size].view(n_layers, total_ctx, num_kv_heads, head_dim)
-        v = kv[..., kv_size:].view(n_layers, total_ctx, num_kv_heads, head_dim)
+        # kv layout is [total_ctx, n_layers, kv_size*2]; permute to
+        # [n_layers, total_ctx, kv_size] before the 4D reshape so the axes
+        # map to the same memory the Triton kernel reads.
+        k = kv[..., :kv_size].permute(1, 0, 2).contiguous().view(
+            n_layers, total_ctx, num_kv_heads, head_dim
+        )
+        v = kv[..., kv_size:].permute(1, 0, 2).contiguous().view(
+            n_layers, total_ctx, num_kv_heads, head_dim
+        )
         k_f = k.to(torch.float32)
         inv_rms = torch.rsqrt(
             k_f.pow(2).mean(dim=-1, keepdim=True)
