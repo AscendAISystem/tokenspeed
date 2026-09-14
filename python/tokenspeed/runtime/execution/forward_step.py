@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import bisect
 import gc
+import os
 import queue
 import time
 from collections.abc import Callable
@@ -66,6 +67,8 @@ logger = get_colorful_logger(__name__)
 
 # Graph-replay probe counters (diagnostic only; no runtime effect).
 _replay_count: dict = {}
+# Probe logging is off by default; enable with TOKENSPEED_GRAPH_PROBE=1.
+_GRAPH_PROBE_ENABLED = os.environ.get("TOKENSPEED_GRAPH_PROBE", "0") == "1"
 
 
 _is_capture_mode = False
@@ -993,15 +996,16 @@ class ForwardStepRunner:
             _replay_t0 = time.monotonic()
             with nvtx_range("graph_replay", color="red"):
                 graph.replay()
-            _replay_ms = (time.monotonic() - _replay_t0) * 1000.0
-            _replay_count[graph_key] = _replay_count.get(graph_key, 0) + 1
-            logger.info(
-                "[GRAPH_PROBE] npu_graph_replay key=%s total_replays=%d replay_ms=%.2f device=%s",
-                graph_key,
-                _replay_count[graph_key],
-                _replay_ms,
-                self.device,
-            )
+            if _GRAPH_PROBE_ENABLED:
+                _replay_ms = (time.monotonic() - _replay_t0) * 1000.0
+                _replay_count[graph_key] = _replay_count.get(graph_key, 0) + 1
+                logger.info(
+                    "[GRAPH_PROBE] npu_graph_replay key=%s total_replays=%d replay_ms=%.2f device=%s",
+                    graph_key,
+                    _replay_count[graph_key],
+                    _replay_ms,
+                    self.device,
+                )
 
             (
                 output_tokens,
