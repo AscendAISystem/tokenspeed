@@ -22,6 +22,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Triton DSV4 kernel exports.
+
+TODO: Moe kernel implementations into their own dedicated files.
+"""
+
 from __future__ import annotations
 
 import functools
@@ -29,6 +34,11 @@ import logging
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import (  # noqa: F401
+    triton_dsv4_decode_topk_mxfp4,
+    triton_dsv4_plan,
+    triton_dsv4_prefill_topk_mxfp4,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
